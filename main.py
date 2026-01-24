@@ -1579,7 +1579,7 @@ async def cmd_start(message: Message, state: FSMContext):
         )
         kb = ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="🛒 Сделать заказ", web_app=WebAppInfo(url=WEBAPP_URL))],
+                [KeyboardButton(text="🛒 Сделать заказ")],
                 [KeyboardButton(text="📋 Мои заказы"), KeyboardButton(text="⚙️ Настройки")]
             ],
             resize_keyboard=True
@@ -1602,6 +1602,36 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(text, reply_markup=kb)
     await state.clear()
 
+@router.message(F.text == "🛒 Сделать заказ")
+async def handle_make_order(message: Message):
+    user_id = message.from_user.id
+    lang = get_user_lang(user_id)
+    profile = get_user_profile(user_id)
+
+    if not profile or not check_dealer(user_id, profile.get("phone", "")):
+        if lang == "ru":
+            await message.answer("❌ У вас нет доступа.")
+        else:
+            await message.answer("❌ Sizda ruxsat yo‘q.")
+
+        await message.answer(
+            "🚫 Меню отключено",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return
+
+    await message.answer(
+        "🛒 Открываю форму заказа",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(
+                    text="➡️ Открыть форму заказа",
+                    web_app=WebAppInfo(url=WEBAPP_URL)
+                )]
+            ],
+            resize_keyboard=True
+        )
+    )
 
 
 
@@ -1896,6 +1926,7 @@ async def handle_webapp_data(message: Message, state: FSMContext):
     # ===========================
     # 📄 Дальше код БЕЗ изменений
     # (генерация PDF, preview, state и т.д.)
+
 
 
 
