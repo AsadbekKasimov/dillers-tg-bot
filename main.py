@@ -1530,22 +1530,28 @@ async def cmd_start(message: Message, state: FSMContext):
         else:
             text = "👋 Xush kelibsiz! Ishni boshlash uchun ro'yxatdan o'tish kerak."
 
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text="📝 Регистрация" if lang == "ru" else "📝 Ro'yxatdan o'tish",
-                callback_data="register"
-            )],
-            [InlineKeyboardButton(
-                text="🇷🇺 Русский" if lang == "uz" else "🇺🇿 O'zbekcha",
-                callback_data="toggle_lang"
-            )]
-        ])
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text="📝 Регистрация" if lang == "ru" else "📝 Ro'yxatdan o'tish",
+                        callback_data="register"
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="🇷🇺 Русский" if lang == "uz" else "🇺🇿 O'zbekcha",
+                        callback_data="toggle_lang"
+                    )
+                ]
+            ]
+        )
 
         await message.answer(text, reply_markup=kb)
         await state.clear()
         return
 
-    # 2️⃣ 🔍 ПРОВЕРКА ДИЛЛЕРА
+    # 2️⃣ Проверка диллера
     is_dealer = check_dealer(
         user_id=user_id,
         phone=profile.get("phone", "")
@@ -1569,7 +1575,7 @@ async def cmd_start(message: Message, state: FSMContext):
         await state.clear()
         return
 
-    # 3️⃣ ✅ ГЛАВНОЕ МЕНЮ (ТОЛЬКО ДЛЯ ДИЛЛЕРА)
+    # 3️⃣ Главное меню диллера (WebApp ТОЛЬКО здесь)
     if lang == "ru":
         text = (
             f"👤 {profile['full_name']}\n"
@@ -1579,9 +1585,16 @@ async def cmd_start(message: Message, state: FSMContext):
         )
         kb = ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="🛒 Сделать заказ",
-                web_app=WebAppInfo(url=WEBAPP_URL)],
-                [KeyboardButton(text="📋 Мои заказы"), KeyboardButton(text="⚙️ Настройки")]
+                [
+                    KeyboardButton(
+                        text="🛒 Сделать заказ",
+                        web_app=WebAppInfo(url=WEBAPP_URL)
+                    )
+                ],
+                [
+                    KeyboardButton(text="📋 Мои заказы"),
+                    KeyboardButton(text="⚙️ Настройки")
+                ]
             ],
             resize_keyboard=True
         )
@@ -1594,14 +1607,23 @@ async def cmd_start(message: Message, state: FSMContext):
         )
         kb = ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="🛒 Buyurtma berish", web_app=WebAppInfo(url=WEBAPP_URL))],
-                [KeyboardButton(text="📋 Mening buyurtmalarim"), KeyboardButton(text="⚙️ Sozlamalar")]
+                [
+                    KeyboardButton(
+                        text="🛒 Buyurtma berish",
+                        web_app=WebAppInfo(url=WEBAPP_URL)
+                    )
+                ],
+                [
+                    KeyboardButton(text="📋 Mening buyurtmalarim"),
+                    KeyboardButton(text="⚙️ Sozlamalar")
+                ]
             ],
             resize_keyboard=True
         )
 
     await message.answer(text, reply_markup=kb)
     await state.clear()
+
 
 
     user_id = message.from_user.id
