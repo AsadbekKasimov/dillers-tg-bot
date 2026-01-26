@@ -1602,17 +1602,19 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(text, reply_markup=kb)
     await state.clear()
 
-@router.message(F.text == "🛒 Сделать заказ")
-async def handle_make_order(message: Message):
+@router.message(F.text.in_(["🛒 Сделать заказ", "🛒 Buyurtma berish"]))
+async def handle_make_order(message: Message, state: FSMContext):
+    """Обработчик кнопки 'Сделать заказ'"""
     user_id = message.from_user.id
     lang = get_user_lang(user_id)
     profile = get_user_profile(user_id)
 
+    # Проверка диллера
     if not profile or not check_dealer(user_id, profile.get("phone", "")):
         if lang == "ru":
             await message.answer("❌ У вас нет доступа.")
         else:
-            await message.answer("❌ Sizda ruxsat yo‘q.")
+            await message.answer("❌ Sizda ruxsat yo'q.")
 
         await message.answer(
             "🚫 Меню отключено",
@@ -1620,23 +1622,34 @@ async def handle_make_order(message: Message):
         )
         return
 
-    await message.answer(
-        "🛒 Открываю форму заказа",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(
-                    text="➡️ Открыть форму заказа",
-                    web_app=WebAppInfo(url=WEBAPP_URL)
-                )]
-            ],
-            resize_keyboard=True
+    # Отправляем сообщение с INLINE кнопкой (под сообщением)
+    if lang == "ru":
+        text = (
+            "🛒 Для оформления заказа нажмите кнопку ниже."
+            
         )
-    )
+        button_text = "➡️ Открыть форму заказа"
+    else:
+        text = (
+            "🛒 Buyurtma berish uchun quyidagi tugmani bosing."
+          
+        )
+        button_text = "➡️ Buyurtma formasini ochish"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=button_text,
+            web_app=WebAppInfo(url=WEBAPP_URL)
+        )]
+    ])
+
+    await message.answer(text, reply_markup=kb)
+    
+    # Сохраняем время отправки кнопки для проверки таймаута
+    await state.update_data(webapp_sent_at=datetime.now().isoformat())
+    await state.set_state(OrderStates.awaiting_order)
 
 
-
-@router.callback_query(F.data == "register")
-async def callback_register(callback: CallbackQuery, state: FSMContext):
     """Начало регистрации"""
     lang = get_user_lang(callback.from_user.id)
     
@@ -1860,6 +1873,35 @@ async def handle_webapp_data(message: Message, state: FSMContext):
     user_id = message.from_user.id
     lang = get_user_lang(user_id)
 
+    # ===========================
+    # 🕐 ПРОВЕРКА ТАЙМАУТА (5 МИНУТ) - НОВОЕ
+    # ===========================
+    data_state = await state.get_data()
+    webapp_sent_at_str = data_state.get("webapp_sent_at")
+    
+    if webapp_sent_at_str:
+        try:
+            webapp_sent_at = datetime.fromisoformat(webapp_sent_at_str)
+            elapsed = datetime.now() - webapp_sent_at
+            
+            if elapsed > timedelta(minutes=5):
+                # Таймаут истёк
+                if lang == "ru":
+                    await message.answer(
+                        "⏰ Срок действия ссылки истёк .\n\n"
+                        "Для нового заказа нажмите /start"
+                    )
+                else:
+                    await message.answer(
+                        "⏰ Havolaning amal qilish muddati tugadi.\n\n"
+                        "Yangi buyurtma uchun /start bosing"
+                    )
+                await state.clear()
+                return
+        except (ValueError, TypeError):
+            # Если не удалось распарсить дату, продолжаем
+            pass
+
     # 🔒 ЖЁСТКАЯ ПРОВЕРКА ДИЛЛЕРА (ЗАКРЫВАЕТ ЛАЗЕЙКУ)
     profile = get_user_profile(user_id)
 
@@ -1872,8 +1914,8 @@ async def handle_webapp_data(message: Message, state: FSMContext):
             )
         else:
             await message.answer(
-                "❌ Sizda buyurtma berish huquqi yo‘q.\n\n"
-                "Siz dillerlar ro‘yxatida yo‘qsiz yoki olib tashlangansiz.\n"
+                "❌ Sizda buyurtma berish huquqi yo'q.\n\n"
+                "Siz dillerlar ro'yxatida yo'qsiz yoki olib tashlangansiz.\n"
                 "Administratorga murojaat qiling."
             )
 
@@ -1928,772 +1970,7 @@ async def handle_webapp_data(message: Message, state: FSMContext):
     # (генерация PDF, preview, state и т.д.)
 
 
-
-
-@router.message(F.text.in_(["📋 Мои заказы", "📋 Mening buyurtmalarim"]))
-async def cmd_my_orders(message: Message):
-    """Просмотр заказов пользователя"""
-    user_id = message.from_user.id
-    lang = get_user_lang(user_id)
-    
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("""
-            SELECT order_id, total, status, created_at 
-            FROM orders 
-            WHERE user_id = ? 
-            ORDER BY created_at DESC 
-            LIMIT 10
-        """, (user_id,))
-        orders = [dict(row) for row in c.fetchall()]
-    
-    if not orders:
-        if lang == "ru":
-            await message.answer("У вас пока нет заказов.")
-        else:
-            await message.answer("Sizda hali buyurtmalar yo'q.")
-        return
-    
-    if lang == "ru":
-        text = "📋 Ваши заказы:\n\n"
-    else:
-        text = "📋 Sizning buyurtmalaringiz:\n\n"
-    
-    status_names = {
-        "pending": "⏳ Ожидает" if lang == "ru" else "⏳ Kutilmoqda",
-        "approved": "✅ Одобрен" if lang == "ru" else "✅ Tasdiqlandi",
-        "production_received": "📋 Производство получило" if lang == "ru" else "📋 Ishlab chiqarish qabul qildi",
-        "production_started": "🏭 В производстве" if lang == "ru" else "🏭 Ishlab chiqarilmoqda",
-        "sent_to_warehouse": "📦 На складе" if lang == "ru" else "📦 Omborga yuborildi",
-        "warehouse_received": "✅ Готов" if lang == "ru" else "✅ Tayyor",
-        "rejected": "❌ Отклонен" if lang == "ru" else "❌ Rad etildi"
-    }
-    
-    for order in orders:
-        status = status_names.get(order["status"], order["status"])
-        text += f"№{order['order_id']}\n"
-        text += f"💰 {format_currency(order['total'])}\n"
-        text += f"📅 {order['created_at'][:10]}\n"
-        text += f"📊 {status}\n\n"
-    
-    await message.answer(text)
-
-
-@router.message(F.text.in_(["⚙️ Настройки", "⚙️ Sozlamalar"]))
-async def cmd_settings(message: Message):
-    """Настройки пользователя"""
-    user_id = message.from_user.id
-    lang = get_user_lang(user_id)
-    profile = get_user_profile(user_id)
-    
-    if lang == "ru":
-        location_text = ""
-        if profile.get('latitude') and profile.get('longitude'):
-            location_text = f"\n📍 Локация: {profile.get('latitude'):.6f}, {profile.get('longitude'):.6f}"
-        text = f"⚙️ Настройки\n\n👤 {profile.get('full_name', 'Не указано')}\n📱 {profile.get('phone', 'Не указано')}\n🏙 {profile.get('city', 'Не указано')}{location_text}"
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🇺🇿 Переключить на узбекский", callback_data="toggle_lang")],
-            [InlineKeyboardButton(text="📝 Изменить профиль", callback_data="register")]
-        ])
-    else:
-        location_text = ""
-        if profile.get('latitude') and profile.get('longitude'):
-            location_text = f"\n📍 Joylashuv: {profile.get('latitude'):.6f}, {profile.get('longitude'):.6f}"
-        text = f"⚙️ Sozlamalar\n\n👤 {profile.get('full_name', 'Kiritilmagan')}\n📱 {profile.get('phone', 'Kiritilmagan')}\n🏙 {profile.get('city', 'Kiritilmagan')}{location_text}"
-        kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🇷🇺 Rus tiliga o'tish", callback_data="toggle_lang")],
-            [InlineKeyboardButton(text="📝 Profilni o'zgartirish", callback_data="register")]
-        ])
-    
-    await message.answer(text, reply_markup=kb)
-
-
-# ==================== ADMIN КОМАНДЫ ====================
-
-@router.message(Command("admin"))
-async def cmd_admin(message: Message):
-    """Админ панель"""
-    user_id = message.from_user.id
-    
-    if user_id not in ALL_ADMIN_IDS:
-        await message.answer("У вас нет доступа к админ-панели.")
-        return
-    
-    # Определяем роль
-    role = "Супер-администратор" if user_id == SUPER_ADMIN_ID else \
-           "Отдел продаж" if user_id in SALES_ADMIN_IDS else \
-           "Отдел производства" if user_id in PRODUCTION_ADMIN_IDS else \
-           "Склад" if user_id in WAREHOUSE_ADMIN_IDS else "Неизвестно"
-    
-    text = f"👨‍💼 Админ-панель\nРоль: {role}\n\n"
-    text += "Доступные команды:\n"
-    
-    if user_id == SUPER_ADMIN_ID:
-        text += "• /orders_export - экспорт заказов\n"
-        text += "• /sendall - массовая рассылка\n"
-        text += "• /send - отправить сообщение пользователю\n"
-        text += "• /get_pdf - получить PDF заказа\n"
-    
-    if has_permission(user_id, AdminRole.SALES):
-        text += "• Одобрение/отклонение заказов\n"
-    
-    if has_permission(user_id, AdminRole.PRODUCTION):
-        text += "• Управление производством\n"
-    
-    if has_permission(user_id, AdminRole.WAREHOUSE):
-        text += "• Управление складом\n"
-    
-    await message.answer(text)
-
-
-# ==================== CALLBACK ОБРАБОТЧИКИ ДЛЯ СТАТУСОВ ====================
-
-@router.callback_query(F.data.startswith("approve:"))
-async def callback_approve_order(callback: CallbackQuery):
-    """Одобрение заказа (отдел продаж)"""
-    user_id = callback.from_user.id
-    
-    if not has_permission(user_id, AdminRole.SALES):
-        await callback.answer("У вас нет прав для одобрения заказов", show_alert=True)
-        return
-    
-    order_id = callback.data.split(":")[1]
-    
-    # Показываем подтверждение
-    kb_confirm = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Да, одобрить", callback_data=f"admapprove_yes:{order_id}"),
-            InlineKeyboardButton(text="❌ Нет, отмена", callback_data=f"admapprove_no:{order_id}")
-        ]
-    ])
-    
-    await callback.message.edit_caption(
-        caption=callback.message.caption + "\n\n⚠️ Вы уверены, что хотите ОДОБРИТЬ этот заказ?",
-        reply_markup=kb_confirm
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("admapprove_yes:"))
-async def callback_approve_order_confirmed(callback: CallbackQuery):
-    """Подтверждение одобрения заказа"""
-    user_id = callback.from_user.id
-    
-    if not has_permission(user_id, AdminRole.SALES):
-        await callback.answer("У вас нет прав", show_alert=True)
-        return
-    
-    order_id = callback.data.split(":")[1]
-    order_data = get_order_raw(order_id)
-    
-    if not order_data:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
-    
-    # Получаем категорию заказа
-    order_category = order_data.get("category")
-    
-    # Получаем координаты клиента
-    client_profile = get_user_profile(order_data["user_id"])
-    client_latitude = client_profile.get("latitude") if client_profile else None
-    client_longitude = client_profile.get("longitude") if client_profile else None
-    
-    # Генерируем финальный PDF
-    order_json = json.loads(order_data["order_json"])
-    pdf_final = generate_order_pdf(
-        order_items=order_json["items"],
-        total=order_json["total"],
-        client_name=order_data["client_name"],
-        admin_name=ADMIN_NAME,
-        order_id=order_id,
-        approved=True,
-        category=order_category,
-        latitude=client_latitude,
-        longitude=client_longitude
-    )
-    
-    # Обновляем статус
-    update_order_status(order_id, OrderStatus.APPROVED, pdf_final, user_id)
-    
-    # Загружаем PDF
-    await upload_pdf_to_hosting_async(order_id, pdf_final)
-    
-    # Уведомляем клиента через группированное сообщение
-    client_user_id = order_data["user_id"]
-    lang = get_user_lang(client_user_id)
-    base_order_id = order_data.get("base_order_id") or order_id
-    await send_or_update_client_notification(base_order_id, client_user_id, lang)
-    
-    # Уведомляем соответствующий цех производства
-    if order_category:
-        production_ids = get_production_ids_for_category(order_category)
-        category_name = get_category_name(order_category)
-        
-        if production_ids:
-            production_text = (
-                f"🔔 Новый одобренный заказ для вашего цеха!\n\n"
-                f"📋 Номер заказа: #{order_id}\n"
-                f"🏭 Категория: {category_name}\n"
-                f"👤 Клиент: {order_data['client_name']}\n"
-                f"💰 Сумма: {format_currency(order_data['total'])}\n\n"
-                f"⏰ Заказ ожидает получения производством"
-            )
-            
-            for prod_id in production_ids:
-                try:
-                    await bot.send_message(
-                        chat_id=prod_id,
-                        text=production_text
-                    )
-                    logger.info(f"Notified production admin {prod_id} for category {category_name}")
-                except Exception as e:
-                    logger.exception(f"Failed to notify production admin {prod_id}")
-    
-    # Получаем информацию об админе
-    admin_name = get_admin_name(user_id)
-    admin_info = f"{admin_name} (ID: {user_id})"
-    current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
-    
-    # Обновляем caption с историей действий
-    original_caption = callback.message.caption
-    # Удаляем старую строку статуса и подтверждение
-    original_caption = re.sub(r'\n📊 Статус:.*?\n━━━━━━━━━━━━━━━━━━━━━━', '', original_caption)
-    original_caption = re.sub(r'\n\n⚠️ Вы уверены.*', '', original_caption)
-    
-    new_caption = (
-        original_caption + 
-        f"\n\n📊 Статус: ✅ Одобрен\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ Одобрен: {admin_info}\n"
-        f"   Время: {current_time}"
-    )
-    
-    # Новые кнопки для следующего этапа
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="📋 Получено производством",
-            callback_data=f"production_received:{order_id}"
-        )]
-    ])
-    
-    await callback.message.edit_caption(
-        caption=new_caption,
-        reply_markup=kb
-    )
-    await callback.answer("✅ Заказ одобрен!")
-
-
-@router.callback_query(F.data.startswith("admapprove_no:"))
-async def callback_approve_order_cancelled(callback: CallbackQuery):
-    """Отмена одобрения"""
-    user_id = callback.from_user.id
-    
-    if not has_permission(user_id, AdminRole.SALES):
-        await callback.answer("У вас нет прав", show_alert=True)
-        return
-    
-    order_id = callback.data.split(":")[1]
-    
-    kb_original = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{order_id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{order_id}")
-        ]
-    ])
-    
-    await callback.message.edit_caption(
-        caption=callback.message.caption.replace("\n\n⚠️ Вы уверены, что хотите ОДОБРИТЬ этот заказ?", ""),
-        reply_markup=kb_original
-    )
-    await callback.answer("Отменено")
-
-
-@router.callback_query(F.data.startswith("reject:"))
-async def callback_reject_order(callback: CallbackQuery):
-    """Отклонение заказа (отдел продаж)"""
-    user_id = callback.from_user.id
-    
-    if not has_permission(user_id, AdminRole.SALES):
-        await callback.answer("У вас нет прав для отклонения заказов", show_alert=True)
-        return
-    
-    order_id = callback.data.split(":")[1]
-    
-    kb_confirm = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Да, отклонить", callback_data=f"admreject_yes:{order_id}"),
-            InlineKeyboardButton(text="❌ Нет, отмена", callback_data=f"admreject_no:{order_id}")
-        ]
-    ])
-    
-    await callback.message.edit_caption(
-        caption=callback.message.caption + "\n\n⚠️ Вы уверены, что хотите ОТКЛОНИТЬ этот заказ?",
-        reply_markup=kb_confirm
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("admreject_yes:"))
-async def callback_reject_order_confirmed(callback: CallbackQuery):
-    """Подтверждение отклонения"""
-    user_id = callback.from_user.id
-    
-    if not has_permission(user_id, AdminRole.SALES):
-        await callback.answer("У вас нет прав", show_alert=True)
-        return
-    
-    order_id = callback.data.split(":")[1]
-    order_data = get_order_raw(order_id)
-    
-    if not order_data:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
-    
-    # Обновляем статус
-    update_order_status(order_id, OrderStatus.REJECTED, updated_by=user_id)
-    
-    # Уведомляем клиента через группированное сообщение
-    client_user_id = order_data["user_id"]
-    lang = get_user_lang(client_user_id)
-    base_order_id = order_data.get("base_order_id") or order_id
-    await send_or_update_client_notification(base_order_id, client_user_id, lang)
-    
-    # Получаем информацию об админе
-    admin_name = get_admin_name(user_id)
-    admin_info = f"{admin_name} (ID: {user_id})"
-    current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
-    
-    # Обновляем caption
-    original_caption = callback.message.caption
-    original_caption = re.sub(r'\n📊 Статус:.*?\n━━━━━━━━━━━━━━━━━━━━━━', '', original_caption)
-    original_caption = re.sub(r'\n\n⚠️ Вы уверены.*', '', original_caption)
-    
-    new_caption = (
-        original_caption + 
-        f"\n\n📊 Статус: ❌ Отклонён\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"❌ Отклонён: {admin_info}\n"
-        f"   Время: {current_time}"
-    )
-    
-    await callback.message.edit_caption(
-        caption=new_caption,
-        reply_markup=None
-    )
-    await callback.answer("❌ Заказ отклонён")
-
-
-@router.callback_query(F.data.startswith("admreject_no:"))
-async def callback_reject_order_cancelled(callback: CallbackQuery):
-    """Отмена отклонения"""
-    user_id = callback.from_user.id
-    
-    if not has_permission(user_id, AdminRole.SALES):
-        await callback.answer("У вас нет прав", show_alert=True)
-        return
-    
-    order_id = callback.data.split(":")[1]
-    
-    kb_original = InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{order_id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{order_id}")
-        ]
-    ])
-    
-    await callback.message.edit_caption(
-        caption=callback.message.caption.replace("\n\n⚠️ Вы уверены, что хотите ОТКЛОНИТЬ этот заказ?", ""),
-        reply_markup=kb_original
-    )
-    await callback.answer("Отменено")
-
-
-@router.callback_query(F.data.startswith("production_received:"))
-async def callback_production_received(callback: CallbackQuery):
-    """Отдел производства получил заказ"""
-    user_id = callback.from_user.id
-    
-    order_id = callback.data.split(":")[1]
-    order_data = get_order_raw(order_id)
-    
-    if not order_data:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
-    
-    # Получаем категорию заказа
-    order_category = order_data.get("category")
-    
-    # Проверяем права для конкретного цеха
-    if not has_permission(user_id, AdminRole.PRODUCTION, order_category):
-        category_name = get_category_name(order_category) if order_category else "этого заказа"
-        await callback.answer(f"У вас нет прав для обработки заказов категории {category_name}", show_alert=True)
-        return
-    
-    # Обновляем статус
-    update_order_status(order_id, OrderStatus.PRODUCTION_RECEIVED, updated_by=user_id)
-    
-    # Уведомляем клиента через группированное сообщение
-    client_user_id = order_data["user_id"]
-    lang = get_user_lang(client_user_id)
-    base_order_id = order_data.get("base_order_id") or order_id
-    await send_or_update_client_notification(base_order_id, client_user_id, lang)
-    
-    # Получаем информацию об админе
-    admin_name = get_admin_name(user_id)
-    admin_info = f"{admin_name} (ID: {user_id})"
-    current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
-    
-    # Обновляем caption с добавлением новой записи
-    original_caption = callback.message.caption
-    original_caption = re.sub(r'\n📊 Статус:.*?\n━━━━━━━━━━━━━━━━━━━━━━', '', original_caption)
-    
-    # Находим блок с историей действий
-    history_match = re.search(r'(✅ Одобрен:.*?Время: \d{2}\.\d{2}\.\d{4} \d{2}:\d{2})', original_caption, re.DOTALL)
-    history_text = history_match.group(1) if history_match else ""
-    
-    new_caption = (
-        original_caption.split("━━━━━━━━━━━━━━━━━━━━━━")[0] +
-        f"\n📊 Статус: 📋 Получен производством\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{history_text}\n"
-        f"📋 Получено производством: {admin_info}\n"
-        f"   Время: {current_time}"
-    )
-    
-    # Новые кнопки
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="🏭 Начать производство",
-            callback_data=f"production_started:{order_id}"
-        )]
-    ])
-    
-    await callback.message.edit_caption(
-        caption=new_caption,
-        reply_markup=kb
-    )
-    await callback.answer("✅ Заказ получен")
-
-
-@router.callback_query(F.data.startswith("production_started:"))
-async def callback_production_started(callback: CallbackQuery):
-    """Производство начато"""
-    user_id = callback.from_user.id
-    
-    order_id = callback.data.split(":")[1]
-    order_data = get_order_raw(order_id)
-    
-    if not order_data:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
-    
-    # Получаем категорию заказа и проверяем права
-    order_category = order_data.get("category")
-    
-    if not has_permission(user_id, AdminRole.PRODUCTION, order_category):
-        category_name = get_category_name(order_category) if order_category else "этого заказа"
-        await callback.answer(f"У вас нет прав для обработки заказов категории {category_name}", show_alert=True)
-        return
-    
-    # Обновляем статус
-    update_order_status(order_id, OrderStatus.PRODUCTION_STARTED, updated_by=user_id)
-    
-    # Уведомляем клиента через группированное сообщение
-    client_user_id = order_data["user_id"]
-    lang = get_user_lang(client_user_id)
-    base_order_id = order_data.get("base_order_id") or order_id
-    await send_or_update_client_notification(base_order_id, client_user_id, lang)
-    
-    # Получаем информацию об админе
-    admin_name = get_admin_name(user_id)
-    admin_info = f"{admin_name} (ID: {user_id})"
-    current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
-    
-    # Обновляем caption
-    original_caption = callback.message.caption
-    original_caption = re.sub(r'\n📊 Статус:.*?\n━━━━━━━━━━━━━━━━━━━━━━', '', original_caption)
-    
-    # Извлекаем всю историю
-    history_section = re.search(r'━━━━━━━━━━━━━━━━━━━━━━\n(.*)', original_caption, re.DOTALL)
-    history_text = history_section.group(1) if history_section else ""
-    
-    new_caption = (
-        original_caption.split("━━━━━━━━━━━━━━━━━━━━━━")[0] +
-        f"\n📊 Статус: 🏭 Производство начато\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{history_text}\n"
-        f"🏭 Производство начато: {admin_info}\n"
-        f"   Время: {current_time}"
-    )
-    
-    # Новые кнопки
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="📦 Передать на склад",
-            callback_data=f"sent_to_warehouse:{order_id}"
-        )]
-    ])
-    
-    await callback.message.edit_caption(
-        caption=new_caption,
-        reply_markup=kb
-    )
-    await callback.answer("✅ Производство начато")
-
-
-@router.callback_query(F.data.startswith("sent_to_warehouse:"))
-async def callback_sent_to_warehouse(callback: CallbackQuery):
-    """Передано на склад"""
-    user_id = callback.from_user.id
-    
-    order_id = callback.data.split(":")[1]
-    order_data = get_order_raw(order_id)
-    
-    if not order_data:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
-    
-    # Получаем категорию заказа и проверяем права
-    order_category = order_data.get("category")
-    
-    if not has_permission(user_id, AdminRole.PRODUCTION, order_category):
-        category_name = get_category_name(order_category) if order_category else "этого заказа"
-        await callback.answer(f"У вас нет прав для обработки заказов категории {category_name}", show_alert=True)
-        return
-    
-    # Обновляем статус
-    update_order_status(order_id, OrderStatus.SENT_TO_WAREHOUSE, updated_by=user_id)
-    
-    # Уведомляем клиента через группированное сообщение
-    client_user_id = order_data["user_id"]
-    lang = get_user_lang(client_user_id)
-    base_order_id = order_data.get("base_order_id") or order_id
-    await send_or_update_client_notification(base_order_id, client_user_id, lang)
-    
-    # Получаем информацию об админе
-    admin_name = get_admin_name(user_id)
-    admin_info = f"{admin_name} (ID: {user_id})"
-    current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
-    
-    # Обновляем caption
-    original_caption = callback.message.caption
-    original_caption = re.sub(r'\n📊 Статус:.*?\n━━━━━━━━━━━━━━━━━━━━━━', '', original_caption)
-    
-    # Извлекаем всю историю
-    history_section = re.search(r'━━━━━━━━━━━━━━━━━━━━━━\n(.*)', original_caption, re.DOTALL)
-    history_text = history_section.group(1) if history_section else ""
-    
-    new_caption = (
-        original_caption.split("━━━━━━━━━━━━━━━━━━━━━━")[0] +
-        f"\n📊 Статус: 📦 Передано на склад\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{history_text}\n"
-        f"📦 Передано на склад: {admin_info}\n"
-        f"   Время: {current_time}"
-    )
-    
-    # Новые кнопки для склада
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(
-            text="✅ Получено складом",
-            callback_data=f"warehouse_received:{order_id}"
-        )]
-    ])
-    
-    await callback.message.edit_caption(
-        caption=new_caption,
-        reply_markup=kb
-    )
-    await callback.answer("✅ Передано на склад")
-
-
-@router.callback_query(F.data.startswith("warehouse_received:"))
-async def callback_warehouse_received(callback: CallbackQuery):
-    """Склад получил партию"""
-    user_id = callback.from_user.id
-    
-    if not has_permission(user_id, AdminRole.WAREHOUSE):
-        await callback.answer("У вас нет прав", show_alert=True)
-        return
-    
-    order_id = callback.data.split(":")[1]
-    order_data = get_order_raw(order_id)
-    
-    if not order_data:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
-    
-    # Обновляем статус
-    update_order_status(order_id, OrderStatus.WAREHOUSE_RECEIVED, updated_by=user_id)
-    
-    # Уведомляем клиента
-    client_user_id = order_data["user_id"]
-    lang = get_user_lang(client_user_id)
-    category = order_data.get("category")
-    
-    # НОВОЕ: Отправляем отдельное уведомление о готовности этой категории
-    if category:
-        await send_category_completion_notification(order_id, category, client_user_id, lang)
-    
-    # Обновляем группированное сообщение со всеми категориями
-    base_order_id = order_data.get("base_order_id") or order_id
-    await send_or_update_client_notification(base_order_id, client_user_id, lang)
-    
-    # Получаем информацию об админе
-    admin_name = get_admin_name(user_id)
-    admin_info = f"{admin_name} (ID: {user_id})"
-    current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
-    
-    # Обновляем caption - финальный статус
-    original_caption = callback.message.caption
-    original_caption = re.sub(r'\n📊 Статус:.*?\n━━━━━━━━━━━━━━━━━━━━━━', '', original_caption)
-    
-    # Извлекаем всю историю
-    history_section = re.search(r'━━━━━━━━━━━━━━━━━━━━━━\n(.*)', original_caption, re.DOTALL)
-    history_text = history_section.group(1) if history_section else ""
-    
-    new_caption = (
-        original_caption.split("━━━━━━━━━━━━━━━━━━━━━━")[0] +
-        f"\n📊 Статус: ✅ Получено складом (ГОТОВО)\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{history_text}\n"
-        f"✅ Получено складом: {admin_info}\n"
-        f"   Время: {current_time}\n\n"
-        f"🎉 Заказ полностью выполнен!"
-    )
-    
-    await callback.message.edit_caption(
-        caption=new_caption,
-        reply_markup=None
-    )
-    await callback.answer("✅ Партия получена")
-
-
-# ==================== ВСПОМОГАТЕЛЬНЫЕ КОМАНДЫ ====================
-
-@router.message(Command("send"))
-async def cmd_send(message: Message):
-    """Отправка сообщения пользователю (только супер-админ)"""
-    if message.from_user.id != SUPER_ADMIN_ID:
-        return
-    
-    parts = message.text.split(maxsplit=2)
-    if len(parts) < 2:
-        await message.answer(
-            "Использование:\n"
-            "• `/send USER_ID текст`\n"
-            "• Или ответь на сообщение с `/send USER_ID`",
-            parse_mode="Markdown"
-        )
-        return
-    
-    try:
-        target_id = int(parts[1])
-    except ValueError:
-        await message.answer("❌ USER_ID должен быть числом.")
-        return
-    
-    payload = parts[2] if len(parts) > 2 else ""
-    ok = False
-    
-    try:
-        if message.photo:
-            file_id = message.photo[-1].file_id
-            await bot.send_photo(chat_id=target_id, photo=file_id, caption=payload or None)
-            ok = True
-        
-        elif message.video:
-            file_id = message.video.file_id
-            await bot.send_video(chat_id=target_id, video=file_id, caption=payload or None)
-            ok = True
-        
-        elif message.reply_to_message:
-            src = message.reply_to_message
-            try:
-                await bot.copy_message(chat_id=target_id, from_chat_id=src.chat.id, message_id=src.message_id)
-                if payload:
-                    await bot.send_message(target_id, payload)
-                ok = True
-            except Exception:
-                try:
-                    await bot.forward_message(chat_id=target_id, from_chat_id=src.chat.id, message_id=src.message_id)
-                    if payload:
-                        await bot.send_message(target_id, payload)
-                    ok = True
-                except Exception:
-                    ok = False
-        
-        else:
-            if not payload:
-                await message.answer("Нет текста для отправки.")
-                return
-            await bot.send_message(target_id, payload)
-            ok = True
-    
-    except Exception:
-        logger.exception("Ошибка при отправке /send")
-        ok = False
-    
-    if ok:
-        await message.answer(f"✅ Отправлено пользователю {target_id}.")
-    else:
-        await message.answer(f"❌ Не удалось отправить пользователю {target_id}.")
-
-
-@router.message(OrderSign.waiting_name)
-async def order_signature_handler(message: Message, state: FSMContext):
-    """Обработка подписи заказа"""
-    try:
-        lang = get_user_lang(message.from_user.id)
-        sign_name = message.text.strip()
-        profile_name = get_user_full_name(message.from_user.id)
-        
-        if not sign_name:
-            if lang == "ru":
-                await message.answer("Пожалуйста, введите имя для подписи.")
-            else:
-                await message.answer("Iltimos, imzo uchun ismingizni kiriting.")
-            return
-        
-        # Проверка совпадения с профилем
-        if profile_name:
-            norm_input = " ".join(sign_name.split()).lower()
-            norm_profile = " ".join(profile_name.split()).lower()
-            
-            if norm_input != norm_profile:
-                if lang == "ru":
-                    await message.answer(
-                        "Имя для подписи должно совпадать с именем при регистрации.\n"
-                        f"Ваше имя: *{profile_name}*\n\n"
-                        "Введите его *точно так же*.",
-                        parse_mode="Markdown"
-                    )
-                else:
-                    await message.answer(
-                        "Imzo uchun ism ro'yxatdan o'tishda yozilgan ism bilan bir xil bo'lishi kerak.\n"
-                        f"Ismingiz: *{profile_name}*\n\n"
-                        "Xuddi shunday kiriting.",
-                        parse_mode="Markdown"
-                    )
-                return
-            final_name = profile_name
-        else:
-            final_name = sign_name
-        
-        # Получаем данные заказа
-        data = await state.get_data()
-        order_data = data.get("order_data")
-        
-        if not order_data:
-            if lang == "ru":
-                await message.answer("Ошибка: данные заказа не найдены. Начните заново с /start")
-            else:
-                await message.answer("Xato: buyurtma ma'lumotlari topilmadi. /start dan qayta boshlang")
-            await state.clear()
-            return
-        
-        # Генерируем базовый ID заказа (без суффикса)
+    # Генерируем базовый ID заказа (без суффикса)
         base_order_id = f"{datetime.now().strftime('%Y%m%d%H%M%S')}{message.from_user.id % 10000:04d}"
         
         # Получаем координаты клиента
