@@ -1625,14 +1625,13 @@ async def handle_make_order(message: Message, state: FSMContext):
     # Отправляем сообщение с INLINE кнопкой (под сообщением)
     if lang == "ru":
         text = (
-            "🛒 Для оформления заказа нажмите кнопку ниже.\n\n"
-            "⏰ Ссылка действительна 5 минут."
-        )
+            "🛒 Для оформления заказа нажмите кнопку ниже."
+                   )
         button_text = "➡️ Открыть форму заказа"
     else:
         text = (
-            "🛒 Buyurtma berish uchun quyidagi tugmani bosing.\n\n"
-            "⏰ Havola 5 daqiqa amal qiladi."
+            "🛒 Buyurtma berish uchun quyidagi tugmani bosing."
+            
         )
         button_text = "➡️ Buyurtma formasini ochish"
 
@@ -1890,12 +1889,12 @@ async def handle_webapp_data(message: Message, state: FSMContext):
                 # Таймаут истёк
                 if lang == "ru":
                     await message.answer(
-                        "⏰ Срок действия ссылки истёк (5 минут).\n\n"
+                        "⏰ Срок действия ссылки истёк.\n\n"
                         "Для нового заказа нажмите /start"
                     )
                 else:
                     await message.answer(
-                        "⏰ Havolaning amal qilish muddati tugadi (5 daqiqa).\n\n"
+                        "⏰ Havolaning amal qilish muddati tugadi.\n\n"
                         "Yangi buyurtma uchun /start bosing"
                     )
                 await state.clear()
@@ -1980,48 +1979,61 @@ async def cmd_my_orders(message: Message):
     user_id = message.from_user.id
     lang = get_user_lang(user_id)
     
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("""
-            SELECT order_id, total, status, created_at 
-            FROM orders 
-            WHERE user_id = ? 
-            ORDER BY created_at DESC 
-            LIMIT 10
-        """, (user_id,))
-        orders = [dict(row) for row in c.fetchall()]
+    logger.info(f"User {user_id} requested orders list")
     
-    if not orders:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.row_factory = sqlite3.Row
+            c = conn.cursor()
+            c.execute("""
+                SELECT order_id, total, status, created_at 
+                FROM orders 
+                WHERE user_id = ? 
+                ORDER BY created_at DESC 
+                LIMIT 10
+            """, (user_id,))
+            orders = [dict(row) for row in c.fetchall()]
+        
+        logger.info(f"Found {len(orders)} orders for user {user_id}")
+        
+        if not orders:
+            if lang == "ru":
+                await message.answer("У вас пока нет заказов.")
+            else:
+                await message.answer("Sizda hali buyurtmalar yo'q.")
+            return
+        
         if lang == "ru":
-            await message.answer("У вас пока нет заказов.")
+            text = "📋 Ваши заказы:\n\n"
         else:
-            await message.answer("Sizda hali buyurtmalar yo'q.")
-        return
+            text = "📋 Sizning buyurtmalaringiz:\n\n"
+        
+        status_names = {
+            "pending": "⏳ Ожидает" if lang == "ru" else "⏳ Kutilmoqda",
+            "approved": "✅ Одобрен" if lang == "ru" else "✅ Tasdiqlandi",
+            "production_received": "📋 Производство получило" if lang == "ru" else "📋 Ishlab chiqarish qabul qildi",
+            "production_started": "🏭 В производстве" if lang == "ru" else "🏭 Ishlab chiqarilmoqda",
+            "sent_to_warehouse": "📦 На складе" if lang == "ru" else "📦 Omborga yuborildi",
+            "warehouse_received": "✅ Готов" if lang == "ru" else "✅ Tayyor",
+            "rejected": "❌ Отклонен" if lang == "ru" else "❌ Rad etildi"
+        }
+        
+        for order in orders:
+            status = status_names.get(order["status"], order["status"])
+            text += f"№{order['order_id']}\n"
+            text += f"💰 {format_currency(order['total'])}\n"
+            text += f"📅 {order['created_at'][:10]}\n"
+            text += f"📊 {status}\n\n"
+        
+        await message.answer(text)
+        logger.info(f"Orders list sent to user {user_id}")
     
-    if lang == "ru":
-        text = "📋 Ваши заказы:\n\n"
-    else:
-        text = "📋 Sizning buyurtmalaringiz:\n\n"
-    
-    status_names = {
-        "pending": "⏳ Ожидает" if lang == "ru" else "⏳ Kutilmoqda",
-        "approved": "✅ Одобрен" if lang == "ru" else "✅ Tasdiqlandi",
-        "production_received": "📋 Производство получило" if lang == "ru" else "📋 Ishlab chiqarish qabul qildi",
-        "production_started": "🏭 В производстве" if lang == "ru" else "🏭 Ishlab chiqarilmoqda",
-        "sent_to_warehouse": "📦 На складе" if lang == "ru" else "📦 Omborga yuborildi",
-        "warehouse_received": "✅ Готов" if lang == "ru" else "✅ Tayyor",
-        "rejected": "❌ Отклонен" if lang == "ru" else "❌ Rad etildi"
-    }
-    
-    for order in orders:
-        status = status_names.get(order["status"], order["status"])
-        text += f"№{order['order_id']}\n"
-        text += f"💰 {format_currency(order['total'])}\n"
-        text += f"📅 {order['created_at'][:10]}\n"
-        text += f"📊 {status}\n\n"
-    
-    await message.answer(text)
+    except Exception as e:
+        logger.exception(f"Error in cmd_my_orders for user {user_id}: {e}")
+        if lang == "ru":
+            await message.answer("❌ Произошла ошибка при загрузке заказов. Попробуйте позже.")
+        else:
+            await message.answer("❌ Buyurtmalarni yuklashda xatolik. Keyinroq urinib ko'ring.")
 
 
 @router.message(F.text.in_(["⚙️ Настройки", "⚙️ Sozlamalar"]))
