@@ -1317,7 +1317,7 @@ def generate_order_pdf(
 
     for item in order_items:
         name_raw = str(item.get("name", "Неизвестно"))
-        qty = int(item.get("qty", 0) or 0)
+        qty = int(item.get("quantity", 0) or 0)
         price = int(item.get("price", 0) or 0)
         image_url = item.get("image", "")  # НОВОЕ: Получаем URL изображения
         product_id = str(item.get("id", ""))  # ДОБАВЛЕНО: Получаем ID продукта
@@ -1975,6 +1975,66 @@ async def handle_webapp_data(message: Message, state: FSMContext):
     # 📄 Дальше код БЕЗ изменений
     # (генерация PDF, preview, state и т.д.)
 
+    # ===========================
+    # 📄 СРАЗУ ФОРМИРУЕМ PDF
+    # ===========================
+    order_items = validated_data["items"]
+    total = validated_data["total"]
+
+    client_name = profile.get("full_name", "Клиент")
+
+    # уникальный ID заказа
+    order_id = f"{user_id}-{int(datetime.now().timestamp())}"
+
+    # ⚠️ ВАЖНО: quantity, а не qty
+    pdf_bytes = generate_order_pdf(
+        order_items=order_items,
+        total=total,
+        client_name=client_name,
+        admin_name=ADMIN_NAME,
+        order_id=order_id,
+        approved=False,
+        latitude=profile.get("latitude"),
+        longitude=profile.get("longitude")
+    )
+
+    # ===========================
+    # 💾 СОХРАНЯЕМ ЗАКАЗ В БД
+    # ===========================
+    save_order(
+        order_id=order_id,
+        client_name=client_name,
+        user_id=user_id,
+        total=total,
+        pdf_draft=pdf_bytes,
+        order_json=validated_data
+    )
+
+    # ===========================
+    # ⏱ РЕГИСТРИРУЕМ COOLDOWN
+    # ===========================
+    rate_limiter.register_order(user_id)
+
+    # ===========================
+    # 📤 ОТПРАВЛЯЕМ PDF КЛИЕНТУ
+    # ===========================
+    if lang == "ru":
+        caption = "📄 Ваш заказ принят. PDF сформирован."
+    else:
+        caption = "📄 Buyurtmangiz qabul qilindi. PDF tayyor."
+
+    await message.answer_document(
+        BufferedInputFile(
+            pdf_bytes,
+            filename=f"order_{order_id}.pdf"
+        ),
+        caption=caption
+    )
+
+    # ===========================
+    # 🧹 ОЧИЩАЕМ STATE
+    # ===========================
+    await state.clear()
 
 
 
