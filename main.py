@@ -1875,166 +1875,81 @@ async def process_full_name(message: Message, state: FSMContext):
 
 @router.message(F.content_type == ContentType.WEB_APP_DATA)
 async def handle_webapp_data(message: Message, state: FSMContext):
-    """Обработка данных из WebApp"""
-    user_id = message.from_user.id
-    lang = get_user_lang(user_id)
-
-    # ===========================
-    # 🕐 ПРОВЕРКА ТАЙМАУТА (5 МИНУТ) - НОВОЕ
-    # ===========================
-    data_state = await state.get_data()
-    webapp_sent_at_str = data_state.get("webapp_sent_at")
-    
-    if webapp_sent_at_str:
-        try:
-            webapp_sent_at = datetime.fromisoformat(webapp_sent_at_str)
-            elapsed = datetime.now() - webapp_sent_at
-            
-            if elapsed > timedelta(minutes=5):
-                # Таймаут истёк
-                if lang == "ru":
-                    await message.answer(
-                        "⏰ Срок действия ссылки истёк.\n\n"
-                        "Для нового заказа нажмите /start"
-                    )
-                else:
-                    await message.answer(
-                        "⏰ Havolaning amal qilish muddati tugadi.\n\n"
-                        "Yangi buyurtma uchun /start bosing"
-                    )
-                await state.clear()
-                return
-        except (ValueError, TypeError):
-            # Если не удалось распарсить дату, продолжаем
-            pass
-
-    # 🔒 ЖЁСТКАЯ ПРОВЕРКА ДИЛЛЕРА (ЗАКРЫВАЕТ ЛАЗЕЙКУ)
-    profile = get_user_profile(user_id)
-
-    if not profile or not check_dealer(user_id, profile.get("phone", "")):
-        if lang == "ru":
-            await message.answer(
-                "❌ У вас нет доступа к оформлению заказов.\n\n"
-                "Вы не найдены в списке диллеров или были удалены.\n"
-                "Обратитесь к администратору."
-            )
-        else:
-            await message.answer(
-                "❌ Sizda buyurtma berish huquqi yo‘q.\n\n"
-                "Siz dillerlar ro‘yxatida yo‘qsiz yoki olib tashlangansiz.\n"
-                "Administratorga murojaat qiling."
-            )
-
-        # ❗ УБИРАЕМ КЛАВИАТУРУ
-        await message.answer(
-            "🚫 Меню отключено",
-            reply_markup=ReplyKeyboardRemove()
-        )
-
-        await state.clear()
-        return
-
-    # ===========================
-    # ⏱ Проверка cooldown
-    can_order, remaining = rate_limiter.check_order_cooldown(user_id)
-    if not can_order:
-        if lang == "ru":
-            await message.answer(
-                f"⏱ Подождите {remaining} секунд перед созданием нового заказа."
-            )
-        else:
-            await message.answer(
-                f"⏱ Yangi buyurtma yaratishdan oldin {remaining} soniya kuting."
-            )
-        return
-
-    # ===========================
-    # 📦 Валидация данных
     try:
-        raw_data = message.web_app_data.data
-        logger.info(f"Received WebApp data from user {user_id}: {raw_data}")
+        user_id = message.from_user.id
+        lang = get_user_lang(user_id)
 
+        # 🕐 таймаут
+        data_state = await state.get_data()
+        webapp_sent_at_str = data_state.get("webapp_sent_at")
+
+        if webapp_sent_at_str:
+            try:
+                webapp_sent_at = datetime.fromisoformat(webapp_sent_at_str)
+                if datetime.now() - webapp_sent_at > timedelta(minutes=5):
+                    await message.answer("⏰ Срок действия ссылки истёк")
+                    await state.clear()
+                    return
+            except:
+                pass
+
+        # 🔒 диллер
+        profile = get_user_profile(user_id)
+        if not profile or not check_dealer(user_id, profile.get("phone", "")):
+            await message.answer("❌ Нет доступа")
+            await state.clear()
+            return
+
+        # ⏱ cooldown
+        can_order, remaining = rate_limiter.check_order_cooldown(user_id)
+        if not can_order:
+            await message.answer(f"⏱ Подождите {remaining} секунд")
+            return
+
+        # 📦 данные
+        raw_data = message.web_app_data.data
         data = json.loads(raw_data)
         validated_data = OrderDataValidator.validate_order_data(data)
 
-    except json.JSONDecodeError:
-        if lang == "ru":
-            await message.answer("❌ Ошибка: некорректный формат данных")
-        else:
-            await message.answer("❌ Xato: noto'g'ri ma'lumot formati")
-        return
+        # 📄 PDF
+        order_id = f"{user_id}-{int(datetime.now().timestamp())}"
+        pdf_bytes = generate_order_pdf(
+            order_items=validated_data["items"],
+            total=validated_data["total"],
+            client_name=profile.get("full_name", "Клиент"),
+            admin_name=ADMIN_NAME,
+            order_id=order_id,
+            approved=False,
+            latitude=profile.get("latitude"),
+            longitude=profile.get("longitude")
+        )
 
-    except ValidationError as e:
-        if lang == "ru":
-            await message.answer(f"❌ Ошибка валидации: {e}")
-        else:
-            await message.answer(f"❌ Tekshirish xatosi: {e}")
-        return
+        # 💾 БД
+        save_order(
+            order_id=order_id,
+            client_name=profile.get("full_name", "Клиент"),
+            user_id=user_id,
+            total=validated_data["total"],
+            pdf_draft=pdf_bytes,
+            order_json=validated_data
+        )
 
-    # ===========================
-    # 📄 Дальше код БЕЗ изменений
-    # (генерация PDF, preview, state и т.д.)
+        rate_limiter.register_order(user_id)
 
-    # ===========================
-    # 📄 СРАЗУ ФОРМИРУЕМ PDF
-    # ===========================
-    order_items = validated_data["items"]
-    total = validated_data["total"]
+        # 📤 отправка
+        await message.answer_document(
+            BufferedInputFile(pdf_bytes, filename=f"order_{order_id}.pdf"),
+            caption="📄 Buyurtmangiz qabul qilindi"
+        )
 
-    client_name = profile.get("full_name", "Клиент")
+        await state.clear()
 
-    # уникальный ID заказа
-    order_id = f"{user_id}-{int(datetime.now().timestamp())}"
-
-    # ⚠️ ВАЖНО: quantity, а не qty
-    pdf_bytes = generate_order_pdf(
-        order_items=order_items,
-        total=total,
-        client_name=client_name,
-        admin_name=ADMIN_NAME,
-        order_id=order_id,
-        approved=False,
-        latitude=profile.get("latitude"),
-        longitude=profile.get("longitude")
-    )
-
-    # ===========================
-    # 💾 СОХРАНЯЕМ ЗАКАЗ В БД
-    # ===========================
-    save_order(
-        order_id=order_id,
-        client_name=client_name,
-        user_id=user_id,
-        total=total,
-        pdf_draft=pdf_bytes,
-        order_json=validated_data
-    )
-
-    # ===========================
-    # ⏱ РЕГИСТРИРУЕМ COOLDOWN
-    # ===========================
-    rate_limiter.register_order(user_id)
-
-    # ===========================
-    # 📤 ОТПРАВЛЯЕМ PDF КЛИЕНТУ
-    # ===========================
-    if lang == "ru":
-        caption = "📄 Ваш заказ принят. PDF сформирован."
-    else:
-        caption = "📄 Buyurtmangiz qabul qilindi. PDF tayyor."
-
-    await message.answer_document(
-        BufferedInputFile(
-            pdf_bytes,
-            filename=f"order_{order_id}.pdf"
-        ),
-        caption=caption
-    )
-
-    # ===========================
-    # 🧹 ОЧИЩАЕМ STATE
-    # ===========================
-    await state.clear()
+    except Exception as e:
+        logger.exception("❌ ERROR IN WEBAPP HANDLER")
+        await message.answer(
+            "❌ Внутренняя ошибка при создании заказа.\n"
+            "Администратор уже уведомлён."
+        )
 
 
 
