@@ -23,8 +23,6 @@ import io
 import sqlite3
 import csv
 import re
-import requests
-
 from datetime import datetime, timedelta
 from ftplib import FTP
 from collections import defaultdict
@@ -307,6 +305,12 @@ STATUS_NAMES_UZ = {
 }
 
 # ==================== НАСТРОЙКИ ====================
+GOOGLE_SCRIPT_URL = os.getenv("GOOGLE_SCRIPT_URL", "")
+DEALER_CHECK_INTERVAL = 10  # 10 сек
+
+dealer_cache = {}
+dealer_block_time = {}
+
 API_TOKEN = os.getenv("API_TOKEN")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID"))
 ADMIN_NAME = os.getenv("ADMIN_NAME", "Administrator")
@@ -986,6 +990,58 @@ def set_user_lang(user_id: int, lang: str):
 
 
 # ==================== ПРОФИЛЬ ====================
+async def check_dealer_status(user_id: int, phone: str, force_check: bool = False) -> dict:
+    if not GOOGLE_SCRIPT_URL:
+        return {"is_active": True}
+
+    if not force_check and user_id in dealer_cache:
+        cached = dealer_cache[user_id]
+        if (datetime.now() - cached["last_check"]).total_seconds() < DEALER_CHECK_INTERVAL:
+            return cached
+
+    clean_phone = re.sub(r'\D', '', phone)
+    url = f"{GOOGLE_SCRIPT_URL}?telegram_id={user_id}&phone={clean_phone}"
+
+    try:
+        response = await asyncio.to_thread(urlopen, url, timeout=10)
+        result = json.loads(response.read().decode())
+
+        info = {
+            "is_dealer": result.get("found", False),
+            "is_active": result.get("is_active", False),
+            "status": result.get("status", "unknown"),
+            "last_check": datetime.now()
+        }
+
+        dealer_cache[user_id] = info
+        if not info["is_active"]:
+            dealer_block_time[user_id] = datetime.now()
+
+        return info
+
+    except Exception:
+        return dealer_cache.get(user_id, {"is_active": True})
+
+
+def is_dealer_active(user_id: int) -> bool:
+    return dealer_cache.get(user_id, {}).get("is_active", False)
+
+
+def get_main_menu_keyboard(user_id: int, lang: str):
+    if not is_dealer_active(user_id):
+        return ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text="⚙️ Настройки")]],
+            resize_keyboard=True
+        )
+
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="🛒 Сделать заказ", web_app=WebAppInfo(url=WEBAPP_URL))],
+            [KeyboardButton(text="📋 Мои заказы"), KeyboardButton(text="⚙️ Настройки")]
+        ],
+        resize_keyboard=True
+    )
+
 
 def get_user_profile(user_id: int) -> Dict[str, str]:
     """Получение профиля пользователя"""
@@ -1024,29 +1080,6 @@ def get_user_full_name(user_id: int) -> Optional[str]:
     profile = get_user_profile(user_id)
     return profile.get("full_name")
 
-# ==================== ПРОВЕРКА ДИЛЛЕРА ====================
-
-from urllib.parse import urlencode
-from urllib.request import urlopen
-import json
-
-def check_dealer(user_id: int, phone: str) -> bool:
-    try:
-        params = urlencode({
-            "telegram_id": user_id,
-            "phone": phone
-        })
-
-        url = f"{os.getenv('DEALERS_API_URL')}?{params}"
-
-        with urlopen(url, timeout=10) as response:
-            data = json.loads(response.read().decode())
-
-        return data.get("found") and data.get("status") == "active"
-
-    except Exception as e:
-        logger.exception("Dealer check failed")
-        return False
 
 # ==================== FTP ====================
 
@@ -1517,18 +1550,20 @@ dp.include_router(router)
 
 @router.message(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
+    """Команда /start с перепроверкой дилера"""
+
     user_id = message.from_user.id
     add_user(user_id)
 
     lang = get_user_lang(user_id)
     profile = get_user_profile(user_id)
 
-    # 1️⃣ Проверка регистрации
+    # ===== 1. ЕСЛИ ПОЛЬЗОВАТЕЛЬ НЕ ЗАРЕГИСТРИРОВАН =====
     if not profile or not all(k in profile for k in ["phone", "city", "full_name"]):
         if lang == "ru":
-            text = "👋 Добро пожаловать! Для начала работы необходимо зарегистрироваться."
+            text = "👋 Добро пожаловать!\n\nДля начала работы необходимо зарегистрироваться."
         else:
-            text = "👋 Xush kelibsiz! Ishni boshlash uchun ro'yxatdan o'tish kerak."
+            text = "👋 Xush kelibsiz!\n\nIshni boshlash uchun ro'yxatdan o'tish kerak."
 
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1548,112 +1583,66 @@ async def cmd_start(message: Message, state: FSMContext):
         )
 
         await message.answer(text, reply_markup=kb)
-        await state.clear()
         return
 
-    # 2️⃣ Проверка диллера
-    is_dealer = check_dealer(
+    # ===== 2. ПЕРЕПРОВЕРКА СТАТУСА ДИЛЕРА (Google Sheets) =====
+    dealer_status = await check_dealer_status(
         user_id=user_id,
         phone=profile.get("phone", "")
     )
 
-    if not is_dealer:
-        if lang == "ru":
-            text = (
-                "❌ У вас нет доступа.\n\n"
-                "Вы не найдены в списке диллеров.\n"
-                "Чтобы стать диллером — обратитесь к администратору."
-            )
-        else:
-            text = (
-                "❌ Sizda ruxsat yo‘q.\n\n"
-                "Siz dillerlar ro‘yxatida yo‘qsiz.\n"
-                "Diller bo‘lish uchun administratorga murojaat qiling."
-            )
-
-        await message.answer(text, reply_markup=ReplyKeyboardRemove())
-        await state.clear()
-        return
-
-    # 3️⃣ Главное меню диллера (WebApp ТОЛЬКО здесь)
+    # ===== 3. ТЕКСТ ПРОФИЛЯ =====
     if lang == "ru":
         text = (
             f"👤 {profile['full_name']}\n"
             f"📱 {profile['phone']}\n"
             f"🏙 {profile['city']}\n\n"
-            "Выберите действие:"
-        )
-        kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [
-                    KeyboardButton(
-                        text="🛒 Сделать заказ",
-                        web_app=WebAppInfo(url=WEBAPP_URL)
-                    )
-                ],
-                [
-                    KeyboardButton(text="📋 Мои заказы"),
-                    KeyboardButton(text="⚙️ Настройки")
-                ]
-            ],
-            resize_keyboard=True
+
         )
     else:
         text = (
             f"👤 {profile['full_name']}\n"
             f"📱 {profile['phone']}\n"
             f"🏙 {profile['city']}\n\n"
-            "Amalni tanlang:"
+
         )
-        kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [
-                    KeyboardButton(
-                        text="🛒 Buyurtma berish",
-                        web_app=WebAppInfo(url=WEBAPP_URL)
-                    )
-                ],
-                [
-                    KeyboardButton(text="📋 Mening buyurtmalarim"),
-                    KeyboardButton(text="⚙️ Sozlamalar")
-                ]
-            ],
-            resize_keyboard=True
-        )
+
+    # ===== 4. ЕСЛИ НЕ АКТИВНЫЙ ДИЛЕР — ДОП. ПРЕДУПРЕЖДЕНИЕ =====
+    if not dealer_status.get("is_active"):
+        if dealer_status.get("is_dealer"):
+            # Есть в списке, но статус не active
+            if lang == "ru":
+                text += (
+                    "\n\n⚠️ ВНИМАНИЕ!\n"
+                    f"Ваш статус: {dealer_status.get('status', 'неизвестно')}\n"
+                    "Функция создания заказов временно недоступна."
+                )
+            else:
+                text += (
+                    "\n\n⚠️ DIQQAT!\n"
+                    f"Sizning holatingiz: {dealer_status.get('status', 'nomaʼlum')}\n"
+                    "Buyurtma yaratish funksiyasi vaqtincha mavjud emas."
+                )
+        else:
+            # Вообще не дилер
+            if lang == "ru":
+                text += (
+                    "\n\n⚠️ ВНИМАНИЕ!\n"
+                    "Вы не найдены в списке дилеров.\n"
+                    "Функция создания заказов недоступна."
+                )
+            else:
+                text += (
+                    "\n\n⚠️ DIQQAT!\n"
+                    "Siz dilerlar ro'yxatida topilmadingiz.\n"
+                    "Buyurtma yaratish funksiyasi mavjud emas."
+                )
+
+    # ===== 5. КЛАВИАТУРА В ЗАВИСИМОСТИ ОТ СТАТУСА =====
+    kb = get_main_menu_keyboard(user_id, lang)
 
     await message.answer(text, reply_markup=kb)
     await state.clear()
-
-
-
-    user_id = message.from_user.id
-    lang = get_user_lang(user_id)
-    profile = get_user_profile(user_id)
-
-    if not profile or not check_dealer(user_id, profile.get("phone", "")):
-        if lang == "ru":
-            await message.answer("❌ У вас нет доступа.")
-        else:
-            await message.answer("❌ Sizda ruxsat yo‘q.")
-
-        await message.answer(
-            "🚫 Меню отключено",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return
-
-    await message.answer(
-        "🛒 Открываю форму заказа",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(
-                    text="➡️ Открыть форму заказа",
-                    web_app=WebAppInfo(url=WEBAPP_URL)
-                )]
-            ],
-            resize_keyboard=True
-        )
-    )
 
 
 
@@ -1806,9 +1795,13 @@ async def process_location(message: Message, state: FSMContext):
 
 @router.message(RegistrationStates.waiting_for_full_name)
 async def process_full_name(message: Message, state: FSMContext):
-    lang = get_user_lang(message.from_user.id)
+    """Обработка полного имени + проверка дилера"""
+
+    user_id = message.from_user.id
+    lang = get_user_lang(user_id)
     full_name = message.text.strip()
 
+    # Проверка имени
     if not full_name or len(full_name) < 2:
         if lang == "ru":
             await message.answer("Пожалуйста, введите корректное имя (минимум 2 символа).")
@@ -1816,7 +1809,10 @@ async def process_full_name(message: Message, state: FSMContext):
             await message.answer("Iltimos, to'g'ri ismni kiriting (kamida 2 ta belgi).")
         return
 
+    # Данные из FSM
     data = await state.get_data()
+
+    # Сохраняем профиль
     profile = {
         "phone": data["phone"],
         "city": data["city"],
@@ -1824,132 +1820,217 @@ async def process_full_name(message: Message, state: FSMContext):
         "latitude": data.get("latitude"),
         "longitude": data.get("longitude")
     }
+    set_user_profile(user_id, profile)
 
-    set_user_profile(message.from_user.id, profile)
-
-    # 🔍 ПРОВЕРКА ДИЛЛЕРА (ВАЖНО: С ОТСТУПОМ!)
-    is_dealer = check_dealer(
-        user_id=message.from_user.id,
-        phone=data["phone"]
+    # 🔍 ПРОВЕРКА ДИЛЕРА ЧЕРЕЗ GOOGLE SHEETS
+    dealer_status = await check_dealer_status(
+        user_id=user_id,
+        phone=data["phone"],
+        force_check=True
     )
 
-    if not is_dealer:
-        if lang == "ru":
-            text = (
-                "❌ У вас нет доступа.\n\n"
-                "Вы не найдены в списке диллеров.\n"
-                "Чтобы стать диллером — обратитесь к администратору."
-            )
-        else:
-            text = (
-                "❌ Sizda ruxsat yo‘q.\n\n"
-                "Siz dillerlar ro‘yxatida yo‘qsiz.\n"
-                "Diller bo‘lish uchun administratorga murojaat qiling."
-            )
-
-        await message.answer(text, reply_markup=ReplyKeyboardRemove())
-        await state.clear()
-        return
-
-    # ✅ ЕСЛИ ДИЛЛЕР — ПОКАЗЫВАЕМ МЕНЮ
+    # Текст регистрации
     if lang == "ru":
-        text = f"✅ Регистрация завершена!\n\n👤 {full_name}\n📱 {data['phone']}\n🏙 {data['city']}"
-        kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="🛒 Сделать заказ", web_app=WebAppInfo(url=WEBAPP_URL))],
-                [KeyboardButton(text="📋 Мои заказы"), KeyboardButton(text="⚙️ Настройки")]
-            ],
-            resize_keyboard=True
+        text = (
+            "✅ Регистрация завершена!\n\n"
+            f"👤 {full_name}\n"
+            f"📱 {data['phone']}\n"
+            f"🏙 {data['city']}"
         )
     else:
-        text = f"✅ Ro'yxatdan o'tish yakunlandi!\n\n👤 {full_name}\n📱 {data['phone']}\n🏙 {data['city']}"
-        kb = ReplyKeyboardMarkup(
-            keyboard=[
-                [KeyboardButton(text="🛒 Buyurtma berish", web_app=WebAppInfo(url=WEBAPP_URL))],
-                [KeyboardButton(text="📋 Mening buyurtmalarim"), KeyboardButton(text="⚙️ Sozlamalar")]
-            ],
-            resize_keyboard=True
+        text = (
+            "✅ Ro'yxatdan o'tish yakunlandi!\n\n"
+            f"👤 {full_name}\n"
+            f"📱 {data['phone']}\n"
+            f"🏙 {data['city']}"
         )
+
+    # Если НЕ активный дилер — добавляем предупреждение
+    if not dealer_status.get("is_active"):
+        if dealer_status.get("is_dealer"):
+            # Есть в списке, но статус не active
+            if lang == "ru":
+                text += (
+                    "\n\n⚠️ ВНИМАНИЕ!\n"
+                    f"Ваш статус: {dealer_status.get('status', 'неизвестно')}\n"
+                    "Функция создания заказов временно недоступна.\n\n"
+                    "Для получения доступа свяжитесь с администратором."
+                )
+            else:
+                text += (
+                    "\n\n⚠️ DIQQAT!\n"
+                    f"Sizning holatingiz: {dealer_status.get('status', 'nomaʼlum')}\n"
+                    "Buyurtma yaratish funksiyasi vaqtincha mavjud emas.\n\n"
+                    "Administrator bilan bogʻlaning."
+                )
+        else:
+            # Вообще не найден в списке дилеров
+            if lang == "ru":
+                text += (
+                    "\n\n⚠️ ВНИМАНИЕ!\n"
+                    "Вы не найдены в списке дилеров.\n"
+                    "Функция создания заказов недоступна.\n\n"
+                    "Для получения доступа свяжитесь с администратором."
+                )
+            else:
+                text += (
+                    "\n\n⚠️ DIQQAT!\n"
+                    "Siz dilerlar roʻyxatida topilmadingiz.\n"
+                    "Buyurtma yaratish funksiyasi mavjud emas.\n\n"
+                    "Administrator bilan bogʻlaning."
+                )
+
+    # 🎛 Клавиатура В ЗАВИСИМОСТИ ОТ СТАТУСА
+    kb = get_main_menu_keyboard(user_id, lang)
 
     await message.answer(text, reply_markup=kb)
     await state.clear()
 
 
-
 @router.message(F.content_type == ContentType.WEB_APP_DATA)
 async def handle_webapp_data(message: Message, state: FSMContext):
-    """Обработка данных из WebApp"""
+    """Обработка данных из WebApp + проверка дилера"""
+
     user_id = message.from_user.id
     lang = get_user_lang(user_id)
 
-    # 🔒 ЖЁСТКАЯ ПРОВЕРКА ДИЛЛЕРА (ЗАКРЫВАЕТ ЛАЗЕЙКУ)
+    # ===== 1. ПРОФИЛЬ ПОЛЬЗОВАТЕЛЯ =====
     profile = get_user_profile(user_id)
 
-    if not profile or not check_dealer(user_id, profile.get("phone", "")):
+    if not profile or not profile.get("phone"):
+        if lang == "ru":
+            await message.answer("❌ Ошибка профиля. Пожалуйста, пройдите регистрацию заново.")
+        else:
+            await message.answer("❌ Profil xatosi. Iltimos, qayta ro'yxatdan o'ting.")
+        return
+
+    # ===== 2. ПРОВЕРКА СТАТУСА ДИЛЕРА (Google Sheets) =====
+    dealer_status = await check_dealer_status(
+        user_id=user_id,
+        phone=profile["phone"]
+    )
+
+    # ❌ ЕСЛИ НЕ АКТИВНЫЙ ДИЛЕР — СРАЗУ ВЫХОД
+    if not dealer_status.get("is_active"):
         if lang == "ru":
             await message.answer(
-                "❌ У вас нет доступа к оформлению заказов.\n\n"
-                "Вы не найдены в списке диллеров или были удалены.\n"
-                "Обратитесь к администратору."
+                "❌ У вас нет доступа к созданию заказов.\n\n"
+                f"Статус: {dealer_status.get('status', 'не в списке')}\n"
+                "Для получения доступа свяжитесь с администратором."
             )
         else:
             await message.answer(
-                "❌ Sizda buyurtma berish huquqi yo‘q.\n\n"
-                "Siz dillerlar ro‘yxatida yo‘qsiz yoki olib tashlangansiz.\n"
-                "Administratorga murojaat qiling."
+                "❌ Sizda buyurtma yaratish huquqi yo'q.\n\n"
+                f"Holat: {dealer_status.get('status', 'roʻyxatda yoʻq')}\n"
+                "Administrator bilan bogʻlaning."
             )
-
-        # ❗ УБИРАЕМ КЛАВИАТУРУ
-        await message.answer(
-            "🚫 Меню отключено",
-            reply_markup=ReplyKeyboardRemove()
-        )
-
-        await state.clear()
         return
 
-    # ===========================
-    # ⏱ Проверка cooldown
+    # ===== 3. COOLDOWN (ЗАЩИТА ОТ СПАМА) =====
     can_order, remaining = rate_limiter.check_order_cooldown(user_id)
+
     if not can_order:
         if lang == "ru":
             await message.answer(
-                f"⏱ Подождите {remaining} секунд перед созданием нового заказа."
+                f"⏱ Подождите {remaining} сек перед созданием нового заказа."
             )
         else:
             await message.answer(
                 f"⏱ Yangi buyurtma yaratishdan oldin {remaining} soniya kuting."
             )
         return
-
-    # ===========================
-    # 📦 Валидация данных
+    
+    # Валидация данных
     try:
         raw_data = message.web_app_data.data
         logger.info(f"Received WebApp data from user {user_id}: {raw_data}")
-
+        
         data = json.loads(raw_data)
+        logger.info(f"Parsed data structure: {json.dumps(data, indent=2, ensure_ascii=False)}")
+        
         validated_data = OrderDataValidator.validate_order_data(data)
-
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        logger.exception(f"JSON decode error for user {user_id}")
         if lang == "ru":
             await message.answer("❌ Ошибка: некорректный формат данных")
         else:
             await message.answer("❌ Xato: noto'g'ri ma'lumot formati")
         return
-
     except ValidationError as e:
+        logger.warning(f"Validation error for user {user_id}: {e}")
         if lang == "ru":
             await message.answer(f"❌ Ошибка валидации: {e}")
         else:
             await message.answer(f"❌ Tekshirish xatosi: {e}")
         return
-
-    # ===========================
-    # 📄 Дальше код БЕЗ изменений
-    # (генерация PDF, preview, state и т.д.)
-
-
+    
+    # Проверка размера PDF
+    estimated_size = len(json.dumps(validated_data)) * 10
+    if estimated_size > PDF_MAX_SIZE_MB * 1024 * 1024:
+        if lang == "ru":
+            await message.answer("❌ Заказ слишком большой. Уменьшите количество товаров.")
+        else:
+            await message.answer("❌ Buyurtma juda katta. Mahsulotlar sonini kamaytiring.")
+        return
+    
+    # Генерируем временный ID заказа для предпросмотра
+    temp_order_id = f"TEMP_{datetime.now().strftime('%Y%m%d%H%M%S')}{user_id % 10000:04d}"
+    
+    # Получаем профиль и координаты клиента
+    profile = get_user_profile(user_id)
+    profile_name = profile.get("full_name", "Клиент")
+    client_latitude = profile.get("latitude") if profile else None
+    client_longitude = profile.get("longitude") if profile else None
+    
+    # Группируем товары по категориям для определения мультикатегорийности
+    grouped_items = group_items_by_category(validated_data["items"])
+    is_multi_category = len(grouped_items) > 1
+    
+    # Для клиента всегда генерируем один PDF со всеми товарами
+    # Категорию не указываем для мультикатегорийных заказов
+    pdf_preview = generate_order_pdf(
+        order_items=validated_data["items"],
+        total=validated_data["total"],
+        client_name=profile_name,
+        admin_name=ADMIN_NAME,
+        order_id=temp_order_id,
+        approved=False,
+        category=None if is_multi_category else get_order_category(validated_data["items"]),
+        latitude=client_latitude,
+        longitude=client_longitude
+    )
+    
+    # Сохраняем данные заказа в состояние
+    await state.update_data(order_data=validated_data)
+    
+    # Отправляем PDF клиенту для проверки
+    pdf_file = BufferedInputFile(pdf_preview, filename=f"order_preview_{temp_order_id}.pdf")
+    
+    if lang == "ru":
+        preview_text = (
+            f"📋 Предпросмотр вашего заказа\n\n"
+            f"💰 Сумма: {format_currency(validated_data['total'])}\n"
+            f"📦 Товаров: {len(validated_data['items'])}\n\n"
+            f"⚠️ ВНИМАНИЕ!\n"
+            f"Внимательно проверьте заказ выше.\n"
+            f"Вы несете ответственность за корректность данных.\n\n"
+            f"❌ Если есть ошибки - вернитесь в меню и создайте заказ заново.\n"
+            f"✅ Если все верно - введите ваше полное имя для подтверждения:"
+        )
+    else:
+        preview_text = (
+            f"📋 Buyurtmangizni ko'rib chiqing\n\n"
+            f"💰 Summa: {format_currency(validated_data['total'])}\n"
+            f"📦 Mahsulotlar: {len(validated_data['items'])}\n\n"
+            f"⚠️ DIQQAT!\n"
+            f"Yuqoridagi buyurtmani diqqat bilan tekshiring.\n"
+            f"Siz ma'lumotlarning to'g'riligiga javobgarsiz.\n\n"
+            f"❌ Agar xato bo'lsa - menyuga qaytib, buyurtmani qayta yarating.\n"
+            f"✅ Agar hammasi to'g'ri bo'lsa - tasdiqlash uchun to'liq ismingizni kiriting:"
+        )
+    
+    await message.answer_document(document=pdf_file, caption=preview_text)
+    await state.set_state(OrderSign.waiting_name)
 
 
 @router.message(F.text.in_(["📋 Мои заказы", "📋 Mening buyurtmalarim"]))
