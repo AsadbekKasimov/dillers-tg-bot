@@ -1579,7 +1579,8 @@ async def cmd_start(message: Message, state: FSMContext):
         )
         kb = ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="🛒 Сделать заказ")],
+                [KeyboardButton(text="🛒 Сделать заказ",
+                web_app=WebAppInfo(url=WEBAPP_URL)],
                 [KeyboardButton(text="📋 Мои заказы"), KeyboardButton(text="⚙️ Настройки")]
             ],
             resize_keyboard=True
@@ -1602,8 +1603,7 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(text, reply_markup=kb)
     await state.clear()
 
-@router.message(F.text == "🛒 Сделать заказ")
-async def handle_make_order(message: Message):
+
     user_id = message.from_user.id
     lang = get_user_lang(user_id)
     profile = get_user_profile(user_id)
