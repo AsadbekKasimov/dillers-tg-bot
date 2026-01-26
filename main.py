@@ -1593,7 +1593,7 @@ async def cmd_start(message: Message, state: FSMContext):
         )
         kb = ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="🛒 Buyurtma berish", web_app=WebAppInfo(url=WEBAPP_URL))],
+                [KeyboardButton(text="🛒 Buyurtma berish")],
                 [KeyboardButton(text="📋 Mening buyurtmalarim"), KeyboardButton(text="⚙️ Sozlamalar")]
             ],
             resize_keyboard=True
@@ -1601,6 +1601,9 @@ async def cmd_start(message: Message, state: FSMContext):
 
     await message.answer(text, reply_markup=kb)
     await state.clear()
+
+
+
 
 @router.message(F.text.in_(["🛒 Сделать заказ", "🛒 Buyurtma berish"]))
 async def handle_make_order(message: Message, state: FSMContext):
@@ -1625,14 +1628,14 @@ async def handle_make_order(message: Message, state: FSMContext):
     # Отправляем сообщение с INLINE кнопкой (под сообщением)
     if lang == "ru":
         text = (
-            "🛒 Для оформления заказа нажмите кнопку ниже."
-            
+            "🛒 Для оформления заказа нажмите кнопку ниже.\n\n"
+            "⏰ Ссылка действительна 5 минут."
         )
         button_text = "➡️ Открыть форму заказа"
     else:
         text = (
-            "🛒 Buyurtma berish uchun quyidagi tugmani bosing."
-          
+            "🛒 Buyurtma berish uchun quyidagi tugmani bosing.\n\n"
+            "⏰ Havola 5 daqiqa amal qiladi."
         )
         button_text = "➡️ Buyurtma formasini ochish"
 
@@ -1847,7 +1850,7 @@ async def process_full_name(message: Message, state: FSMContext):
         text = f"✅ Регистрация завершена!\n\n👤 {full_name}\n📱 {data['phone']}\n🏙 {data['city']}"
         kb = ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="🛒 Сделать заказ", web_app=WebAppInfo(url=WEBAPP_URL))],
+                [KeyboardButton(text="🛒 Сделать заказ")],
                 [KeyboardButton(text="📋 Мои заказы"), KeyboardButton(text="⚙️ Настройки")]
             ],
             resize_keyboard=True
@@ -1856,7 +1859,7 @@ async def process_full_name(message: Message, state: FSMContext):
         text = f"✅ Ro'yxatdan o'tish yakunlandi!\n\n👤 {full_name}\n📱 {data['phone']}\n🏙 {data['city']}"
         kb = ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text="🛒 Buyurtma berish", web_app=WebAppInfo(url=WEBAPP_URL))],
+                [KeyboardButton(text="🛒 Buyurtma berish")],
                 [KeyboardButton(text="📋 Mening buyurtmalarim"), KeyboardButton(text="⚙️ Sozlamalar")]
             ],
             resize_keyboard=True
@@ -1888,12 +1891,12 @@ async def handle_webapp_data(message: Message, state: FSMContext):
                 # Таймаут истёк
                 if lang == "ru":
                     await message.answer(
-                        "⏰ Срок действия ссылки истёк .\n\n"
+                        "⏰ Срок действия ссылки истёк (5 минут).\n\n"
                         "Для нового заказа нажмите /start"
                     )
                 else:
                     await message.answer(
-                        "⏰ Havolaning amal qilish muddati tugadi.\n\n"
+                        "⏰ Havolaning amal qilish muddati tugadi (5 daqiqa).\n\n"
                         "Yangi buyurtma uchun /start bosing"
                     )
                 await state.clear()
