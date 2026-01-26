@@ -1483,6 +1483,10 @@ class RegistrationStates(StatesGroup):
     waiting_for_full_name = State()
 
 
+class OrderStates(StatesGroup):
+    awaiting_order = State()
+
+
 class OrderSign(StatesGroup):
     waiting_name = State()
 
@@ -1626,7 +1630,8 @@ async def handle_make_order(message: Message, state: FSMContext):
     if lang == "ru":
         text = (
             "🛒 Для оформления заказа нажмите кнопку ниже."
-                   )
+        
+        )
         button_text = "➡️ Открыть форму заказа"
     else:
         text = (
