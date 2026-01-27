@@ -110,7 +110,7 @@ async def refresh_main_menu(user_id: int):
     try:
         sent = await bot.send_message(
             chat_id=user_id,
-            text="\u2060",  # невидимый символ (Word Joiner)
+            text="⏳",  # невидимый символ (Word Joiner)
             reply_markup=kb
         )
 
