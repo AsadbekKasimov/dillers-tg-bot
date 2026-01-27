@@ -65,6 +65,67 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from PIL import Image
 
+# ==================== КОНФИГУРАЦИЯ ТАЙМЕРА WEBAPP ====================
+# Время активности кнопки "Сделать заказ" в секундах
+WEBAPP_BUTTON_TIMEOUT = 30  # 30 секунд
+
+# Словарь для хранения времени последнего /start для каждого пользователя
+user_start_times: Dict[int, datetime] = {}
+
+
+def is_webapp_button_active(user_id: int) -> bool:
+    """Проверяет, активна ли кнопка WebApp для пользователя"""
+    if user_id not in user_start_times:
+        logger.warning(f"[TIMER] User {user_id} not in user_start_times - button INACTIVE")
+        return False
+
+    elapsed = (datetime.now() - user_start_times[user_id]).total_seconds()
+    is_active = elapsed <= WEBAPP_BUTTON_TIMEOUT
+
+    logger.info(f"[TIMER] User {user_id}: elapsed={elapsed:.1f}s, timeout={WEBAPP_BUTTON_TIMEOUT}s, active={is_active}")
+
+    return is_active
+
+
+def update_user_start_time(user_id: int):
+    """Обновляет время последнего /start для пользователя"""
+    user_start_times[user_id] = datetime.now()
+    logger.info(f"[TIMER] User {user_id} timer STARTED at {user_start_times[user_id]}")
+
+
+def get_remaining_time(user_id: int) -> int:
+    """Возвращает оставшееся время в секундах"""
+    if user_id not in user_start_times:
+        return 0
+
+    elapsed = (datetime.now() - user_start_times[user_id]).total_seconds()
+    remaining = WEBAPP_BUTTON_TIMEOUT - elapsed
+    return max(0, int(remaining))
+
+# 🔄 Принудительное обновление главного меню (для скрытия WebApp)
+async def refresh_main_menu(user_id: int):
+    lang = get_user_lang(user_id)
+    kb = get_main_menu_keyboard(user_id, lang)
+
+    try:
+        sent = await bot.send_message(
+            chat_id=user_id,
+            text="\u2060",  # невидимый символ (Word Joiner)
+            reply_markup=kb
+        )
+
+        # 🧹 авто-удаление через 1 секунду
+        await asyncio.sleep(3)
+        await bot.delete_message(
+            chat_id=user_id,
+            message_id=sent.message_id
+        )
+
+    except Exception as e:
+        logger.warning(f"Failed to refresh menu for {user_id}: {e}")
+
+# ======================================================================
+
 # ==================== НАСТРОЙКИ АДМИНИСТРАТОРОВ ====================
 
 class AdminRole:
@@ -73,6 +134,7 @@ class AdminRole:
     SALES = "sales"
     PRODUCTION = "production"
     WAREHOUSE = "warehouse"
+
 
 # Загрузка ID администраторов из .env
 SUPER_ADMIN_ID = int(os.getenv("SUPER_ADMIN_ID"))
@@ -88,10 +150,10 @@ PRODUCTION_CHEMICALS_IDS = [int(x.strip()) for x in os.getenv("PRODUCTION_CHEMIC
 PRODUCTION_FRAGRANCES_IDS = [int(x.strip()) for x in os.getenv("PRODUCTION_FRAGRANCES_IDS", "").split(",") if x.strip()]
 
 # Объединенный список производственных админов (все цеха вместе)
-PRODUCTION_ADMIN_IDS = (PRODUCTION_CLEANING_IDS + PRODUCTION_PLASTICPE_IDS + 
-                       PRODUCTION_PLASTICPET_IDS + PRODUCTION_PLASTICPP_IDS + 
-                       PRODUCTION_PLASTICTD_IDS + PRODUCTION_CHEMICALS_IDS + 
-                       PRODUCTION_FRAGRANCES_IDS)
+PRODUCTION_ADMIN_IDS = (PRODUCTION_CLEANING_IDS + PRODUCTION_PLASTICPE_IDS +
+                        PRODUCTION_PLASTICPET_IDS + PRODUCTION_PLASTICPP_IDS +
+                        PRODUCTION_PLASTICTD_IDS + PRODUCTION_CHEMICALS_IDS +
+                        PRODUCTION_FRAGRANCES_IDS)
 
 WAREHOUSE_ADMIN_IDS = [int(x.strip()) for x in os.getenv("WAREHOUSE_ADMIN_IDS", "").split(",") if x.strip()]
 
@@ -120,13 +182,14 @@ CATEGORY_NAMES = {
     "fragrances": "Отдушки",
 }
 
+
 # Функция проверки прав доступа
 def has_permission(user_id: int, required_role: str, order_category: str = None) -> bool:
     """Проверяет, есть ли у пользователя права для выполнения действия"""
     # Супер-админ имеет доступ ко всему
     if user_id == SUPER_ADMIN_ID:
         return True
-    
+
     if required_role == AdminRole.SALES:
         return user_id in SALES_ADMIN_IDS
     elif required_role == AdminRole.PRODUCTION:
@@ -138,7 +201,7 @@ def has_permission(user_id: int, required_role: str, order_category: str = None)
         return user_id in PRODUCTION_ADMIN_IDS
     elif required_role == AdminRole.WAREHOUSE:
         return user_id in WAREHOUSE_ADMIN_IDS
-    
+
     return False
 
 
@@ -159,10 +222,10 @@ def get_order_category(order_items: list) -> str:
     """Определяет категорию заказа на основе товаров (первого товара)"""
     if not order_items:
         return None
-    
+
     # Получаем ID первого товара
     first_item_id = order_items[0].get("id", 0)
-    
+
     # Определяем категорию по диапазону ID
     if 10000 <= first_item_id < 20000:
         return "cleaning"
@@ -178,7 +241,7 @@ def get_order_category(order_items: list) -> str:
         return "chemicals"
     elif 70000 <= first_item_id < 80000:
         return "fragrances"
-    
+
     return None
 
 
@@ -203,7 +266,7 @@ def get_category_by_item_id(item_id: int) -> str:
 
 def group_items_by_category(order_items: list) -> dict:
     """Группирует товары по категориям
-    
+
     Возвращает словарь: {category: [items]}
     """
     grouped = {}
@@ -243,6 +306,7 @@ def get_category_emoji(category: str) -> str:
     """Возвращает эмодзи категории"""
     return CATEGORY_EMOJIS.get(category, "📦")
 
+
 # ==================== СТАТУСЫ ЗАКАЗОВ ====================
 
 class OrderStatus:
@@ -254,6 +318,7 @@ class OrderStatus:
     SENT_TO_WAREHOUSE = "sent_to_warehouse"  # Отправлено на склад
     WAREHOUSE_RECEIVED = "warehouse_received"  # Склад получил
     REJECTED = "rejected"  # Отклонен
+
 
 STATUS_MESSAGES = {
     OrderStatus.APPROVED: {
@@ -281,7 +346,6 @@ STATUS_MESSAGES = {
         "uz": "❌ Sizning buyurtmangiz #{order_id} rad etildi.\n\nTafsilotlarni bilish uchun administrator bilan bog'laning."
     }
 }
-
 
 # Названия статусов для отображения
 STATUS_NAMES_RU = {
@@ -464,6 +528,43 @@ rate_limiter = RateLimitMiddleware(
 )
 
 
+# ==================== WEBAPP TIMER MIDDLEWARE ====================
+
+class WebAppTimerMiddleware(BaseMiddleware):
+    """Middleware для проверки активности кнопки WebApp"""
+
+    async def __call__(
+            self,
+            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+            event: TelegramObject,
+            data: Dict[str, Any]
+    ) -> Any:
+        # Проверяем, является ли событие сообщением с web_app_data
+        if isinstance(event, Message) and event.web_app_data:
+            user_id = event.from_user.id
+            logger.info(f"[TIMER MIDDLEWARE] WebApp data received from user {user_id}")
+
+            # Проверяем, активна ли кнопка
+            if not is_webapp_button_active(user_id):
+                logger.warning(f"[TIMER MIDDLEWARE] BLOCKING WebApp for user {user_id} - timer expired!")
+
+                # Отправляем сообщение без определения языка (или используем русский по умолчанию)
+                await event.answer(
+                    "⏰ Время действия кнопки истекло.\n"
+                    "Пожалуйста, нажмите /start для создания нового заказа.\n\n"
+                    "⏰ Tugma faolligi tugadi.\n"
+                    "Iltimos, yangi buyurtma yaratish uchun /start ni bosing.",
+                    reply_markup=ReplyKeyboardRemove()
+                )
+
+                return  # Прерываем обработку
+
+            logger.info(f"[TIMER MIDDLEWARE] ALLOWING WebApp for user {user_id} - timer active")
+
+        # Продолжаем обработку
+        return await handler(event, data)
+
+
 # ==================== ВАЛИДАЦИЯ ДАННЫХ ====================
 
 class ValidationError(Exception):
@@ -564,43 +665,43 @@ def init_db():
                 order_json TEXT
             )
         """)
-        
+
         # Добавляем новые колонки, если их нет
         try:
             c.execute("ALTER TABLE orders ADD COLUMN approved_by INTEGER")
         except sqlite3.OperationalError:
             pass
-        
+
         try:
             c.execute("ALTER TABLE orders ADD COLUMN production_received_by INTEGER")
         except sqlite3.OperationalError:
             pass
-        
+
         try:
             c.execute("ALTER TABLE orders ADD COLUMN production_started_by INTEGER")
         except sqlite3.OperationalError:
             pass
-        
+
         try:
             c.execute("ALTER TABLE orders ADD COLUMN sent_to_warehouse_by INTEGER")
         except sqlite3.OperationalError:
             pass
-        
+
         try:
             c.execute("ALTER TABLE orders ADD COLUMN warehouse_received_by INTEGER")
         except sqlite3.OperationalError:
             pass
-        
+
         try:
             c.execute("ALTER TABLE orders ADD COLUMN category TEXT")
         except sqlite3.OperationalError:
             pass
-        
+
         try:
             c.execute("ALTER TABLE orders ADD COLUMN base_order_id TEXT")
         except sqlite3.OperationalError:
             pass
-        
+
         # Новая таблица для хранения message_id уведомлений клиента
         c.execute("""
             CREATE TABLE IF NOT EXISTS client_notifications (
@@ -610,7 +711,7 @@ def init_db():
                 created_at TEXT NOT NULL
             )
         """)
-        
+
         conn.commit()
 
 
@@ -642,7 +743,7 @@ def update_order_status(order_id: str, new_status: str, pdf_final: bytes = None,
     """Обновление статуса заказа"""
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        
+
         # Определяем, какое поле обновлять
         field_map = {
             OrderStatus.APPROVED: "approved_by",
@@ -651,7 +752,7 @@ def update_order_status(order_id: str, new_status: str, pdf_final: bytes = None,
             OrderStatus.SENT_TO_WAREHOUSE: "sent_to_warehouse_by",
             OrderStatus.WAREHOUSE_RECEIVED: "warehouse_received_by"
         }
-        
+
         if pdf_final:
             c.execute("""
                 UPDATE orders 
@@ -664,7 +765,7 @@ def update_order_status(order_id: str, new_status: str, pdf_final: bytes = None,
                 SET status = ?
                 WHERE order_id = ?
             """, (new_status, order_id))
-        
+
         # Обновляем поле с ID администратора
         if updated_by and new_status in field_map:
             field_name = field_map[new_status]
@@ -673,7 +774,7 @@ def update_order_status(order_id: str, new_status: str, pdf_final: bytes = None,
                 SET {field_name} = ?
                 WHERE order_id = ?
             """, (updated_by, order_id))
-        
+
         conn.commit()
 
 
@@ -766,23 +867,23 @@ def get_client_notification(base_order_id: str) -> Optional[Dict[str, Any]]:
 
 def build_grouped_status_message(base_order_id: str, lang: str = "ru") -> str:
     """Создает сводное сообщение о статусе всех категорий заказа"""
-    
+
     # Получаем все под-заказы
     sub_orders = get_orders_by_base_id(base_order_id)
-    
+
     if not sub_orders:
         return ""
-    
+
     # Группируем по категориям
     categories_info = {}
     total_sum = 0
     total_items = 0
-    
+
     for order in sub_orders:
         category = order.get("category")
         status = order.get("status", OrderStatus.PENDING)
         total_sum += order.get("total", 0)
-        
+
         # Получаем количество товаров из order_json
         order_json_str = order.get("order_json", "{}")
         try:
@@ -792,19 +893,19 @@ def build_grouped_status_message(base_order_id: str, lang: str = "ru") -> str:
             total_items += item_count
         except:
             item_count = 0
-        
+
         if category:
             categories_info[category] = {
                 "status": status,
                 "item_count": item_count,
                 "sum": order.get("total", 0)
             }
-    
+
     # Строим сообщение
     if lang == "ru":
         text = f"📦 Заказ №{base_order_id}\n\n"
         text += "📊 Статус по категориям:\n\n"
-        
+
         for category, info in sorted(categories_info.items()):
             emoji = get_category_emoji(category)
             cat_name = get_category_name(category)
@@ -813,14 +914,14 @@ def build_grouped_status_message(base_order_id: str, lang: str = "ru") -> str:
             text += f"{emoji} {cat_name}\n"
             text += f"{status_name}\n"
             text += f"Товаров: {item_count} | Сумма: {format_currency(info['sum'])}\n\n"
-        
+
         text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
         text += f"📦 Всего товаров: {total_items}\n"
         text += f"💰 Общая сумма: {format_currency(total_sum)}"
     else:
         text = f"📦 Buyurtma №{base_order_id}\n\n"
         text += "📊 Kategoriyalar bo'yicha holat:\n\n"
-        
+
         for category, info in sorted(categories_info.items()):
             emoji = get_category_emoji(category)
             cat_name = get_category_name(category)
@@ -829,26 +930,26 @@ def build_grouped_status_message(base_order_id: str, lang: str = "ru") -> str:
             text += f"{emoji} {cat_name}\n"
             text += f"{status_name}\n"
             text += f"Mahsulotlar: {item_count} | Summa: {format_currency(info['sum'])}\n\n"
-        
+
         text += f"━━━━━━━━━━━━━━━━━━━━━━\n"
         text += f"📦 Jami mahsulotlar: {total_items}\n"
         text += f"💰 Umumiy summa: {format_currency(total_sum)}"
-    
+
     return text
 
 
 async def send_or_update_client_notification(base_order_id: str, user_id: int, lang: str = "ru"):
     """Отправляет или обновляет сводное сообщение клиенту"""
-    
+
     # Получаем текст сообщения
     message_text = build_grouped_status_message(base_order_id, lang)
-    
+
     if not message_text:
         return
-    
+
     # Проверяем, есть ли уже сообщение
     notification = get_client_notification(base_order_id)
-    
+
     try:
         if notification:
             # Обновляем существующее сообщение
@@ -867,23 +968,21 @@ async def send_or_update_client_notification(base_order_id: str, user_id: int, l
             # Сохраняем message_id
             save_client_notification(base_order_id, user_id, sent_message.message_id)
             logger.info(f"Sent new client notification for order {base_order_id}")
-    
+
     except Exception as e:
         logger.exception(f"Failed to send/update client notification for order {base_order_id}")
 
 
-
-
 async def send_category_completion_notification(order_id: str, category: str, user_id: int, lang: str = "ru"):
     """Отправляет отдельное уведомление о готовности конкретной категории"""
-    
+
     order_data = get_order_raw(order_id)
     if not order_data:
         return
-    
+
     emoji = get_category_emoji(category)
     cat_name = get_category_name(category)
-    
+
     # Получаем информацию о товарах
     order_json_str = order_data.get("order_json", "{}")
     try:
@@ -892,7 +991,7 @@ async def send_category_completion_notification(order_id: str, category: str, us
         item_count = len(items)
     except:
         item_count = 0
-    
+
     if lang == "ru":
         text = (
             f"✅ Отличные новости!\n\n"
@@ -901,7 +1000,7 @@ async def send_category_completion_notification(order_id: str, category: str, us
             f"🎉 Полностью готов и ожидает на складе!\n\n"
             f"📦 Товаров: {item_count}\n"
             f"💰 Сумма: {format_currency(order_data.get('total', 0))}\n\n"
-            
+
         )
     else:
         text = (
@@ -911,9 +1010,9 @@ async def send_category_completion_notification(order_id: str, category: str, us
             f"🎉 To'liq tayyor va omborda kutmoqda!\n\n"
             f"📦 Mahsulotlar: {item_count}\n"
             f"💰 Summa: {format_currency(order_data.get('total', 0))}\n\n"
-            
+
         )
-    
+
     try:
         await bot.send_message(
             chat_id=user_id,
@@ -934,7 +1033,7 @@ def add_user(user_id: int):
         if os.path.exists(USERS_FILE):
             with open(USERS_FILE, "r", encoding="utf-8") as f:
                 existing = set(line.strip() for line in f if line.strip())
-        
+
         if str(user_id) not in existing:
             with open(USERS_FILE, "a", encoding="utf-8") as f:
                 f.write(f"{user_id}\n")
@@ -946,7 +1045,7 @@ def get_all_user_ids() -> List[int]:
     """Получение всех ID пользователей"""
     if not os.path.exists(USERS_FILE):
         return []
-    
+
     try:
         with open(USERS_FILE, "r", encoding="utf-8") as f:
             return [int(line.strip()) for line in f if line.strip()]
@@ -961,7 +1060,7 @@ def get_user_lang(user_id: int) -> str:
     """Получение языка пользователя"""
     if not os.path.exists(LANG_FILE):
         return "ru"
-    
+
     try:
         with open(LANG_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -979,9 +1078,9 @@ def set_user_lang(user_id: int, lang: str):
                 data = json.load(f)
         except:
             pass
-    
+
     data[str(user_id)] = lang
-    
+
     try:
         with open(LANG_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1024,30 +1123,57 @@ async def check_dealer_status(user_id: int, phone: str, force_check: bool = Fals
 
 
 def is_dealer_active(user_id: int) -> bool:
-    return dealer_cache.get(user_id, {}).get("is_active", False)
+    # если ещё не проверяли дилера — считаем активным
+    if user_id not in dealer_cache:
+        return True
+    return dealer_cache[user_id].get("is_active", True)
+
 
 
 def get_main_menu_keyboard(user_id: int, lang: str):
+    # ❌ дилер не активен — без WebApp
     if not is_dealer_active(user_id):
         return ReplyKeyboardMarkup(
             keyboard=[[KeyboardButton(text="⚙️ Настройки")]],
             resize_keyboard=True
         )
 
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🛒 Сделать заказ", web_app=WebAppInfo(url=WEBAPP_URL))],
-            [KeyboardButton(text="📋 Мои заказы"), KeyboardButton(text="⚙️ Настройки")]
-        ],
-        resize_keyboard=True
-    )
+    # ⏳ проверка таймера WebApp
+    if is_webapp_button_active(user_id):
+        # ✅ WebApp доступен
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(
+                    text="🛒 Сделать заказ",
+                    web_app=WebAppInfo(url=WEBAPP_URL)
+                )],
+                [KeyboardButton(text="📋 Мои заказы"), KeyboardButton(text="⚙️ Настройки")]
+            ],
+            resize_keyboard=True
+        )
+    else:
+        # ⛔ WebApp запрещён
+        text = (
+            "Главный меню"
+            if lang == "ru"
+            else "Bosh menyu"
+        )
+
+        return ReplyKeyboardMarkup(
+            keyboard=[
+                [KeyboardButton(text=text)],
+                [KeyboardButton(text="📋 Мои заказы"), KeyboardButton(text="⚙️ Настройки")]
+            ],
+            resize_keyboard=True
+        )
+
 
 
 def get_user_profile(user_id: int) -> Dict[str, str]:
     """Получение профиля пользователя"""
     if not os.path.exists(PROFILE_FILE):
         return {}
-    
+
     try:
         with open(PROFILE_FILE, "r", encoding="utf-8") as f:
             data = json.load(f)
@@ -1065,9 +1191,9 @@ def set_user_profile(user_id: int, profile: Dict[str, str]):
                 data = json.load(f)
         except:
             pass
-    
+
     data[str(user_id)] = profile
-    
+
     try:
         with open(PROFILE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
@@ -1085,6 +1211,7 @@ def get_user_full_name(user_id: int) -> Optional[str]:
 
 try:
     import aioftp
+
     AIOFTP_AVAILABLE = True
 except ImportError:
     AIOFTP_AVAILABLE = False
@@ -1094,32 +1221,32 @@ except ImportError:
 async def upload_pdf_to_hosting_async(order_id: str, pdf_bytes: bytes) -> tuple[bool, str]:
     """Асинхронная загрузка PDF на хостинг"""
     filename = f"order_{order_id}.pdf"
-    
+
     if not HOSTING_FTP_HOST:
         logger.warning("FTP host not configured")
         return False, ""
-    
+
     if AIOFTP_AVAILABLE:
         try:
             async with aioftp.Client.context(
-                HOSTING_FTP_HOST,
-                user=HOSTING_FTP_USER,
-                password=HOSTING_FTP_PASS,
-                socket_timeout=FTP_TIMEOUT
+                    HOSTING_FTP_HOST,
+                    user=HOSTING_FTP_USER,
+                    password=HOSTING_FTP_PASS,
+                    socket_timeout=FTP_TIMEOUT
             ) as client:
                 if HOSTING_FTP_DIR:
                     await client.change_directory(HOSTING_FTP_DIR)
-                
+
                 await client.upload(
                     io.BytesIO(pdf_bytes),
                     filename,
                     write_into=True
                 )
-                
+
                 url = f"{HOSTING_BASE_URL}/{filename}"
                 logger.info(f"PDF uploaded successfully: {url}")
                 return True, url
-                
+
         except Exception as e:
             logger.exception(f"Error uploading PDF to FTP")
             return False, ""
@@ -1130,22 +1257,22 @@ async def upload_pdf_to_hosting_async(order_id: str, pdf_bytes: bytes) -> tuple[
 def _upload_pdf_sync(order_id: str, pdf_bytes: bytes) -> tuple[bool, str]:
     """Синхронная загрузка PDF на хостинг"""
     filename = f"order_{order_id}.pdf"
-    
+
     try:
         ftp = FTP(timeout=FTP_TIMEOUT)
         ftp.connect(HOSTING_FTP_HOST)
         ftp.login(HOSTING_FTP_USER, HOSTING_FTP_PASS)
-        
+
         if HOSTING_FTP_DIR:
             ftp.cwd(HOSTING_FTP_DIR)
-        
+
         ftp.storbinary(f"STOR {filename}", io.BytesIO(pdf_bytes))
         ftp.quit()
-        
+
         url = f"{HOSTING_BASE_URL}/{filename}"
         logger.info(f"PDF uploaded successfully (sync): {url}")
         return True, url
-        
+
     except Exception as e:
         logger.exception(f"Error uploading PDF to FTP (sync)")
         return False, ""
@@ -1267,7 +1394,7 @@ def generate_order_pdf(
         c.drawRightString(width - right_margin, height - top_margin + 4 * mm, f"№ {order_id}")
         c.setFont(main_font, 9)
         c.drawString(left_margin, height - top_margin - 10 * mm, f"Клиент: {client_name}")
-        
+
         # Добавляем категорию если она указана
         current_y_offset = 16 * mm
         if category:
@@ -1277,17 +1404,18 @@ def generate_order_pdf(
             c.drawString(left_margin, height - top_margin - current_y_offset, f"Категория: {category_name}")
             c.setFillColor(colors.black)
             current_y_offset += 6 * mm
-        
+
         # Добавляем координаты если они указаны
         if latitude is not None and longitude is not None:
             c.setFont(main_font, 9)
             c.setFillColor(colors.Color(100 / 255, 100 / 255, 100 / 255))
-            c.drawString(left_margin, height - top_margin - current_y_offset, f"📍 Координаты: {latitude:.6f}, {longitude:.6f}")
+            c.drawString(left_margin, height - top_margin - current_y_offset,
+                         f"📍 Координаты: {latitude:.6f}, {longitude:.6f}")
             c.setFillColor(colors.black)
             current_y_offset += 6 * mm
-        
+
         y = height - top_margin - current_y_offset
-        
+
         c.drawRightString(width - right_margin, height - top_margin - 10 * mm,
                           datetime.now().strftime("%d.%m.%Y %H:%M"))
 
@@ -1541,6 +1669,7 @@ router = Router()
 
 # Добавляем middleware
 dp.message.middleware(rate_limiter)
+dp.message.middleware(WebAppTimerMiddleware())
 
 # Регистрируем роутер
 dp.include_router(router)
@@ -1554,6 +1683,16 @@ async def cmd_start(message: Message, state: FSMContext):
 
     user_id = message.from_user.id
     add_user(user_id)
+
+    # ===== ОБНОВЛЕНИЕ ТАЙМЕРА WEBAPP =====
+    update_user_start_time(user_id)
+
+    # ⏳ Авто-скрытие WebApp кнопки
+    async def expire_webapp_keyboard():
+        await asyncio.sleep(WEBAPP_BUTTON_TIMEOUT)
+        await refresh_main_menu(user_id)
+
+    asyncio.create_task(expire_webapp_keyboard())
 
     lang = get_user_lang(user_id)
     profile = get_user_profile(user_id)
@@ -1644,13 +1783,29 @@ async def cmd_start(message: Message, state: FSMContext):
     await message.answer(text, reply_markup=kb)
     await state.clear()
 
+    @router.message(F.text.in_([
+        "Главный меню",
+        "Bosh menyu"
+    ]))
+    async def expired_button_as_start(message: Message, state: FSMContext):
+        await cmd_start(message, state)
+        return
 
+# ⛔ БЛОКИРОВКА УСТАРЕВШЕЙ КНОПКИ WEBAPP
+@router.message(F.text == "🛒 Сделать заказ")
+async def block_expired_webapp(message: Message):
+    if not is_webapp_button_active(message.from_user.id):
+        await message.answer(
+            "⏰ Время для создания заказа истекло.\n"
+            "Нажмите /start.",
+            reply_markup=ReplyKeyboardRemove()
+        )
 
 @router.callback_query(F.data == "register")
 async def callback_register(callback: CallbackQuery, state: FSMContext):
     """Начало регистрации"""
     lang = get_user_lang(callback.from_user.id)
-    
+
     if lang == "ru":
         text = "📱 Поделитесь своим номером телефона:"
         kb = ReplyKeyboardMarkup(
@@ -1665,7 +1820,7 @@ async def callback_register(callback: CallbackQuery, state: FSMContext):
             resize_keyboard=True,
             one_time_keyboard=True
         )
-    
+
     await callback.message.answer(text, reply_markup=kb)
     await state.set_state(RegistrationStates.waiting_for_phone)
     await callback.answer()
@@ -1678,14 +1833,14 @@ async def callback_toggle_lang(callback: CallbackQuery):
     current_lang = get_user_lang(user_id)
     new_lang = "uz" if current_lang == "ru" else "ru"
     set_user_lang(user_id, new_lang)
-    
+
     if new_lang == "ru":
         text = "🇷🇺 Язык изменён на русский"
     else:
         text = "🇺🇿 Til o'zbek tiliga o'zgartirildi"
-    
+
     await callback.answer(text, show_alert=True)
-    
+
     # Обновляем меню
     profile = get_user_profile(user_id)
     if not profile or not all(k in profile for k in ["phone", "city", "full_name"]):
@@ -1693,7 +1848,7 @@ async def callback_toggle_lang(callback: CallbackQuery):
             text = "👋 Добро пожаловать! Для начала работы необходимо зарегистрироваться."
         else:
             text = "👋 Xush kelibsiz! Ishni boshlash uchun ro'yxatdan o'tish kerak."
-        
+
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(
                 text="📝 Регистрация" if new_lang == "ru" else "📝 Ro'yxatdan o'tish",
@@ -1704,7 +1859,7 @@ async def callback_toggle_lang(callback: CallbackQuery):
                 callback_data="toggle_lang"
             )]
         ])
-        
+
         await callback.message.edit_text(text, reply_markup=kb)
 
 
@@ -1712,22 +1867,22 @@ async def callback_toggle_lang(callback: CallbackQuery):
 async def process_phone(message: Message, state: FSMContext):
     """Обработка номера телефона"""
     lang = get_user_lang(message.from_user.id)
-    
+
     if not message.contact:
         if lang == "ru":
             await message.answer("Пожалуйста, используйте кнопку для отправки номера.")
         else:
             await message.answer("Iltimos, raqamni yuborish uchun tugmadan foydalaning.")
         return
-    
+
     phone = message.contact.phone_number
     await state.update_data(phone=phone)
-    
+
     if lang == "ru":
         text = "🏙 Введите ваш город:"
     else:
         text = "🏙 Shaharingizni kiriting:"
-    
+
     await message.answer(text, reply_markup=ReplyKeyboardRemove())
     await state.set_state(RegistrationStates.waiting_for_city)
 
@@ -1737,16 +1892,16 @@ async def process_city(message: Message, state: FSMContext):
     """Обработка города"""
     lang = get_user_lang(message.from_user.id)
     city = message.text.strip()
-    
+
     if not city:
         if lang == "ru":
             await message.answer("Пожалуйста, введите город.")
         else:
             await message.answer("Iltimos, shaharni kiriting.")
         return
-    
+
     await state.update_data(city=city)
-    
+
     # Запрос локации
     if lang == "ru":
         text = "📍 Теперь поделитесь своей геолокацией:"
@@ -1762,7 +1917,7 @@ async def process_city(message: Message, state: FSMContext):
             resize_keyboard=True,
             one_time_keyboard=True
         )
-    
+
     await message.answer(text, reply_markup=kb)
     await state.set_state(RegistrationStates.waiting_for_location)
 
@@ -1771,24 +1926,24 @@ async def process_city(message: Message, state: FSMContext):
 async def process_location(message: Message, state: FSMContext):
     """Обработка геолокации"""
     lang = get_user_lang(message.from_user.id)
-    
+
     if not message.location:
         if lang == "ru":
             await message.answer("Пожалуйста, используйте кнопку для отправки локации.")
         else:
             await message.answer("Iltimos, joylashuvni yuborish uchun tugmadan foydalaning.")
         return
-    
+
     latitude = message.location.latitude
     longitude = message.location.longitude
-    
+
     await state.update_data(latitude=latitude, longitude=longitude)
-    
+
     if lang == "ru":
         text = "👤 Введите ваше полное имя:"
     else:
         text = "👤 To'liq ismingizni kiriting:"
-    
+
     await message.answer(text, reply_markup=ReplyKeyboardRemove())
     await state.set_state(RegistrationStates.waiting_for_full_name)
 
@@ -1939,15 +2094,15 @@ async def handle_webapp_data(message: Message, state: FSMContext):
                 f"⏱ Yangi buyurtma yaratishdan oldin {remaining} soniya kuting."
             )
         return
-    
+
     # Валидация данных
     try:
         raw_data = message.web_app_data.data
         logger.info(f"Received WebApp data from user {user_id}: {raw_data}")
-        
+
         data = json.loads(raw_data)
         logger.info(f"Parsed data structure: {json.dumps(data, indent=2, ensure_ascii=False)}")
-        
+
         validated_data = OrderDataValidator.validate_order_data(data)
     except json.JSONDecodeError as e:
         logger.exception(f"JSON decode error for user {user_id}")
@@ -1963,7 +2118,7 @@ async def handle_webapp_data(message: Message, state: FSMContext):
         else:
             await message.answer(f"❌ Tekshirish xatosi: {e}")
         return
-    
+
     # Проверка размера PDF
     estimated_size = len(json.dumps(validated_data)) * 10
     if estimated_size > PDF_MAX_SIZE_MB * 1024 * 1024:
@@ -1972,20 +2127,20 @@ async def handle_webapp_data(message: Message, state: FSMContext):
         else:
             await message.answer("❌ Buyurtma juda katta. Mahsulotlar sonini kamaytiring.")
         return
-    
+
     # Генерируем временный ID заказа для предпросмотра
     temp_order_id = f"TEMP_{datetime.now().strftime('%Y%m%d%H%M%S')}{user_id % 10000:04d}"
-    
+
     # Получаем профиль и координаты клиента
     profile = get_user_profile(user_id)
     profile_name = profile.get("full_name", "Клиент")
     client_latitude = profile.get("latitude") if profile else None
     client_longitude = profile.get("longitude") if profile else None
-    
+
     # Группируем товары по категориям для определения мультикатегорийности
     grouped_items = group_items_by_category(validated_data["items"])
     is_multi_category = len(grouped_items) > 1
-    
+
     # Для клиента всегда генерируем один PDF со всеми товарами
     # Категорию не указываем для мультикатегорийных заказов
     pdf_preview = generate_order_pdf(
@@ -1999,13 +2154,13 @@ async def handle_webapp_data(message: Message, state: FSMContext):
         latitude=client_latitude,
         longitude=client_longitude
     )
-    
+
     # Сохраняем данные заказа в состояние
     await state.update_data(order_data=validated_data)
-    
+
     # Отправляем PDF клиенту для проверки
     pdf_file = BufferedInputFile(pdf_preview, filename=f"order_preview_{temp_order_id}.pdf")
-    
+
     if lang == "ru":
         preview_text = (
             f"📋 Предпросмотр вашего заказа\n\n"
@@ -2028,7 +2183,7 @@ async def handle_webapp_data(message: Message, state: FSMContext):
             f"❌ Agar xato bo'lsa - menyuga qaytib, buyurtmani qayta yarating.\n"
             f"✅ Agar hammasi to'g'ri bo'lsa - tasdiqlash uchun to'liq ismingizni kiriting:"
         )
-    
+
     await message.answer_document(document=pdf_file, caption=preview_text)
     await state.set_state(OrderSign.waiting_name)
 
@@ -2038,7 +2193,7 @@ async def cmd_my_orders(message: Message):
     """Просмотр заказов пользователя"""
     user_id = message.from_user.id
     lang = get_user_lang(user_id)
-    
+
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         c = conn.cursor()
@@ -2050,19 +2205,19 @@ async def cmd_my_orders(message: Message):
             LIMIT 10
         """, (user_id,))
         orders = [dict(row) for row in c.fetchall()]
-    
+
     if not orders:
         if lang == "ru":
             await message.answer("У вас пока нет заказов.")
         else:
             await message.answer("Sizda hali buyurtmalar yo'q.")
         return
-    
+
     if lang == "ru":
         text = "📋 Ваши заказы:\n\n"
     else:
         text = "📋 Sizning buyurtmalaringiz:\n\n"
-    
+
     status_names = {
         "pending": "⏳ Ожидает" if lang == "ru" else "⏳ Kutilmoqda",
         "approved": "✅ Одобрен" if lang == "ru" else "✅ Tasdiqlandi",
@@ -2072,14 +2227,14 @@ async def cmd_my_orders(message: Message):
         "warehouse_received": "✅ Готов" if lang == "ru" else "✅ Tayyor",
         "rejected": "❌ Отклонен" if lang == "ru" else "❌ Rad etildi"
     }
-    
+
     for order in orders:
         status = status_names.get(order["status"], order["status"])
         text += f"№{order['order_id']}\n"
         text += f"💰 {format_currency(order['total'])}\n"
         text += f"📅 {order['created_at'][:10]}\n"
         text += f"📊 {status}\n\n"
-    
+
     await message.answer(text)
 
 
@@ -2089,7 +2244,7 @@ async def cmd_settings(message: Message):
     user_id = message.from_user.id
     lang = get_user_lang(user_id)
     profile = get_user_profile(user_id)
-    
+
     if lang == "ru":
         location_text = ""
         if profile.get('latitude') and profile.get('longitude'):
@@ -2108,7 +2263,7 @@ async def cmd_settings(message: Message):
             [InlineKeyboardButton(text="🇷🇺 Rus tiliga o'tish", callback_data="toggle_lang")],
             [InlineKeyboardButton(text="📝 Profilni o'zgartirish", callback_data="register")]
         ])
-    
+
     await message.answer(text, reply_markup=kb)
 
 
@@ -2118,35 +2273,35 @@ async def cmd_settings(message: Message):
 async def cmd_admin(message: Message):
     """Админ панель"""
     user_id = message.from_user.id
-    
+
     if user_id not in ALL_ADMIN_IDS:
         await message.answer("У вас нет доступа к админ-панели.")
         return
-    
+
     # Определяем роль
     role = "Супер-администратор" if user_id == SUPER_ADMIN_ID else \
-           "Отдел продаж" if user_id in SALES_ADMIN_IDS else \
-           "Отдел производства" if user_id in PRODUCTION_ADMIN_IDS else \
-           "Склад" if user_id in WAREHOUSE_ADMIN_IDS else "Неизвестно"
-    
+        "Отдел продаж" if user_id in SALES_ADMIN_IDS else \
+            "Отдел производства" if user_id in PRODUCTION_ADMIN_IDS else \
+                "Склад" if user_id in WAREHOUSE_ADMIN_IDS else "Неизвестно"
+
     text = f"👨‍💼 Админ-панель\nРоль: {role}\n\n"
     text += "Доступные команды:\n"
-    
+
     if user_id == SUPER_ADMIN_ID:
         text += "• /orders_export - экспорт заказов\n"
         text += "• /sendall - массовая рассылка\n"
         text += "• /send - отправить сообщение пользователю\n"
         text += "• /get_pdf - получить PDF заказа\n"
-    
+
     if has_permission(user_id, AdminRole.SALES):
         text += "• Одобрение/отклонение заказов\n"
-    
+
     if has_permission(user_id, AdminRole.PRODUCTION):
         text += "• Управление производством\n"
-    
+
     if has_permission(user_id, AdminRole.WAREHOUSE):
         text += "• Управление складом\n"
-    
+
     await message.answer(text)
 
 
@@ -2156,13 +2311,13 @@ async def cmd_admin(message: Message):
 async def callback_approve_order(callback: CallbackQuery):
     """Одобрение заказа (отдел продаж)"""
     user_id = callback.from_user.id
-    
+
     if not has_permission(user_id, AdminRole.SALES):
         await callback.answer("У вас нет прав для одобрения заказов", show_alert=True)
         return
-    
+
     order_id = callback.data.split(":")[1]
-    
+
     # Показываем подтверждение
     kb_confirm = InlineKeyboardMarkup(inline_keyboard=[
         [
@@ -2170,7 +2325,7 @@ async def callback_approve_order(callback: CallbackQuery):
             InlineKeyboardButton(text="❌ Нет, отмена", callback_data=f"admapprove_no:{order_id}")
         ]
     ])
-    
+
     await callback.message.edit_caption(
         caption=callback.message.caption + "\n\n⚠️ Вы уверены, что хотите ОДОБРИТЬ этот заказ?",
         reply_markup=kb_confirm
@@ -2182,26 +2337,26 @@ async def callback_approve_order(callback: CallbackQuery):
 async def callback_approve_order_confirmed(callback: CallbackQuery):
     """Подтверждение одобрения заказа"""
     user_id = callback.from_user.id
-    
+
     if not has_permission(user_id, AdminRole.SALES):
         await callback.answer("У вас нет прав", show_alert=True)
         return
-    
+
     order_id = callback.data.split(":")[1]
     order_data = get_order_raw(order_id)
-    
+
     if not order_data:
         await callback.answer("Заказ не найден", show_alert=True)
         return
-    
+
     # Получаем категорию заказа
     order_category = order_data.get("category")
-    
+
     # Получаем координаты клиента
     client_profile = get_user_profile(order_data["user_id"])
     client_latitude = client_profile.get("latitude") if client_profile else None
     client_longitude = client_profile.get("longitude") if client_profile else None
-    
+
     # Генерируем финальный PDF
     order_json = json.loads(order_data["order_json"])
     pdf_final = generate_order_pdf(
@@ -2215,24 +2370,24 @@ async def callback_approve_order_confirmed(callback: CallbackQuery):
         latitude=client_latitude,
         longitude=client_longitude
     )
-    
+
     # Обновляем статус
     update_order_status(order_id, OrderStatus.APPROVED, pdf_final, user_id)
-    
+
     # Загружаем PDF
     await upload_pdf_to_hosting_async(order_id, pdf_final)
-    
+
     # Уведомляем клиента через группированное сообщение
     client_user_id = order_data["user_id"]
     lang = get_user_lang(client_user_id)
     base_order_id = order_data.get("base_order_id") or order_id
     await send_or_update_client_notification(base_order_id, client_user_id, lang)
-    
+
     # Уведомляем соответствующий цех производства
     if order_category:
         production_ids = get_production_ids_for_category(order_category)
         category_name = get_category_name(order_category)
-        
+
         if production_ids:
             production_text = (
                 f"🔔 Новый одобренный заказ для вашего цеха!\n\n"
@@ -2242,7 +2397,7 @@ async def callback_approve_order_confirmed(callback: CallbackQuery):
                 f"💰 Сумма: {format_currency(order_data['total'])}\n\n"
                 f"⏰ Заказ ожидает получения производством"
             )
-            
+
             for prod_id in production_ids:
                 try:
                     await bot.send_message(
@@ -2252,26 +2407,26 @@ async def callback_approve_order_confirmed(callback: CallbackQuery):
                     logger.info(f"Notified production admin {prod_id} for category {category_name}")
                 except Exception as e:
                     logger.exception(f"Failed to notify production admin {prod_id}")
-    
+
     # Получаем информацию об админе
     admin_name = get_admin_name(user_id)
     admin_info = f"{admin_name} (ID: {user_id})"
     current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
-    
+
     # Обновляем caption с историей действий
     original_caption = callback.message.caption
     # Удаляем старую строку статуса и подтверждение
     original_caption = re.sub(r'\n📊 Статус:.*?\n━━━━━━━━━━━━━━━━━━━━━━', '', original_caption)
     original_caption = re.sub(r'\n\n⚠️ Вы уверены.*', '', original_caption)
-    
+
     new_caption = (
-        original_caption + 
-        f"\n\n📊 Статус: ✅ Одобрен\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"✅ Одобрен: {admin_info}\n"
-        f"   Время: {current_time}"
+            original_caption +
+            f"\n\n📊 Статус: ✅ Одобрен\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"✅ Одобрен: {admin_info}\n"
+            f"   Время: {current_time}"
     )
-    
+
     # Новые кнопки для следующего этапа
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
@@ -2279,7 +2434,7 @@ async def callback_approve_order_confirmed(callback: CallbackQuery):
             callback_data=f"production_received:{order_id}"
         )]
     ])
-    
+
     await callback.message.edit_caption(
         caption=new_caption,
         reply_markup=kb
@@ -2291,20 +2446,20 @@ async def callback_approve_order_confirmed(callback: CallbackQuery):
 async def callback_approve_order_cancelled(callback: CallbackQuery):
     """Отмена одобрения"""
     user_id = callback.from_user.id
-    
+
     if not has_permission(user_id, AdminRole.SALES):
         await callback.answer("У вас нет прав", show_alert=True)
         return
-    
+
     order_id = callback.data.split(":")[1]
-    
+
     kb_original = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{order_id}"),
             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{order_id}")
         ]
     ])
-    
+
     await callback.message.edit_caption(
         caption=callback.message.caption.replace("\n\n⚠️ Вы уверены, что хотите ОДОБРИТЬ этот заказ?", ""),
         reply_markup=kb_original
@@ -2316,20 +2471,20 @@ async def callback_approve_order_cancelled(callback: CallbackQuery):
 async def callback_reject_order(callback: CallbackQuery):
     """Отклонение заказа (отдел продаж)"""
     user_id = callback.from_user.id
-    
+
     if not has_permission(user_id, AdminRole.SALES):
         await callback.answer("У вас нет прав для отклонения заказов", show_alert=True)
         return
-    
+
     order_id = callback.data.split(":")[1]
-    
+
     kb_confirm = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Да, отклонить", callback_data=f"admreject_yes:{order_id}"),
             InlineKeyboardButton(text="❌ Нет, отмена", callback_data=f"admreject_no:{order_id}")
         ]
     ])
-    
+
     await callback.message.edit_caption(
         caption=callback.message.caption + "\n\n⚠️ Вы уверены, что хотите ОТКЛОНИТЬ этот заказ?",
         reply_markup=kb_confirm
@@ -2341,45 +2496,45 @@ async def callback_reject_order(callback: CallbackQuery):
 async def callback_reject_order_confirmed(callback: CallbackQuery):
     """Подтверждение отклонения"""
     user_id = callback.from_user.id
-    
+
     if not has_permission(user_id, AdminRole.SALES):
         await callback.answer("У вас нет прав", show_alert=True)
         return
-    
+
     order_id = callback.data.split(":")[1]
     order_data = get_order_raw(order_id)
-    
+
     if not order_data:
         await callback.answer("Заказ не найден", show_alert=True)
         return
-    
+
     # Обновляем статус
     update_order_status(order_id, OrderStatus.REJECTED, updated_by=user_id)
-    
+
     # Уведомляем клиента через группированное сообщение
     client_user_id = order_data["user_id"]
     lang = get_user_lang(client_user_id)
     base_order_id = order_data.get("base_order_id") or order_id
     await send_or_update_client_notification(base_order_id, client_user_id, lang)
-    
+
     # Получаем информацию об админе
     admin_name = get_admin_name(user_id)
     admin_info = f"{admin_name} (ID: {user_id})"
     current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
-    
+
     # Обновляем caption
     original_caption = callback.message.caption
     original_caption = re.sub(r'\n📊 Статус:.*?\n━━━━━━━━━━━━━━━━━━━━━━', '', original_caption)
     original_caption = re.sub(r'\n\n⚠️ Вы уверены.*', '', original_caption)
-    
+
     new_caption = (
-        original_caption + 
-        f"\n\n📊 Статус: ❌ Отклонён\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"❌ Отклонён: {admin_info}\n"
-        f"   Время: {current_time}"
+            original_caption +
+            f"\n\n📊 Статус: ❌ Отклонён\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"❌ Отклонён: {admin_info}\n"
+            f"   Время: {current_time}"
     )
-    
+
     await callback.message.edit_caption(
         caption=new_caption,
         reply_markup=None
@@ -2391,20 +2546,20 @@ async def callback_reject_order_confirmed(callback: CallbackQuery):
 async def callback_reject_order_cancelled(callback: CallbackQuery):
     """Отмена отклонения"""
     user_id = callback.from_user.id
-    
+
     if not has_permission(user_id, AdminRole.SALES):
         await callback.answer("У вас нет прав", show_alert=True)
         return
-    
+
     order_id = callback.data.split(":")[1]
-    
+
     kb_original = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{order_id}"),
             InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{order_id}")
         ]
     ])
-    
+
     await callback.message.edit_caption(
         caption=callback.message.caption.replace("\n\n⚠️ Вы уверены, что хотите ОТКЛОНИТЬ этот заказ?", ""),
         reply_markup=kb_original
@@ -2416,54 +2571,54 @@ async def callback_reject_order_cancelled(callback: CallbackQuery):
 async def callback_production_received(callback: CallbackQuery):
     """Отдел производства получил заказ"""
     user_id = callback.from_user.id
-    
+
     order_id = callback.data.split(":")[1]
     order_data = get_order_raw(order_id)
-    
+
     if not order_data:
         await callback.answer("Заказ не найден", show_alert=True)
         return
-    
+
     # Получаем категорию заказа
     order_category = order_data.get("category")
-    
+
     # Проверяем права для конкретного цеха
     if not has_permission(user_id, AdminRole.PRODUCTION, order_category):
         category_name = get_category_name(order_category) if order_category else "этого заказа"
         await callback.answer(f"У вас нет прав для обработки заказов категории {category_name}", show_alert=True)
         return
-    
+
     # Обновляем статус
     update_order_status(order_id, OrderStatus.PRODUCTION_RECEIVED, updated_by=user_id)
-    
+
     # Уведомляем клиента через группированное сообщение
     client_user_id = order_data["user_id"]
     lang = get_user_lang(client_user_id)
     base_order_id = order_data.get("base_order_id") or order_id
     await send_or_update_client_notification(base_order_id, client_user_id, lang)
-    
+
     # Получаем информацию об админе
     admin_name = get_admin_name(user_id)
     admin_info = f"{admin_name} (ID: {user_id})"
     current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
-    
+
     # Обновляем caption с добавлением новой записи
     original_caption = callback.message.caption
     original_caption = re.sub(r'\n📊 Статус:.*?\n━━━━━━━━━━━━━━━━━━━━━━', '', original_caption)
-    
+
     # Находим блок с историей действий
     history_match = re.search(r'(✅ Одобрен:.*?Время: \d{2}\.\d{2}\.\d{4} \d{2}:\d{2})', original_caption, re.DOTALL)
     history_text = history_match.group(1) if history_match else ""
-    
+
     new_caption = (
-        original_caption.split("━━━━━━━━━━━━━━━━━━━━━━")[0] +
-        f"\n📊 Статус: 📋 Получен производством\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{history_text}\n"
-        f"📋 Получено производством: {admin_info}\n"
-        f"   Время: {current_time}"
+            original_caption.split("━━━━━━━━━━━━━━━━━━━━━━")[0] +
+            f"\n📊 Статус: 📋 Получен производством\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{history_text}\n"
+            f"📋 Получено производством: {admin_info}\n"
+            f"   Время: {current_time}"
     )
-    
+
     # Новые кнопки
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
@@ -2471,7 +2626,7 @@ async def callback_production_received(callback: CallbackQuery):
             callback_data=f"production_started:{order_id}"
         )]
     ])
-    
+
     await callback.message.edit_caption(
         caption=new_caption,
         reply_markup=kb
@@ -2483,53 +2638,53 @@ async def callback_production_received(callback: CallbackQuery):
 async def callback_production_started(callback: CallbackQuery):
     """Производство начато"""
     user_id = callback.from_user.id
-    
+
     order_id = callback.data.split(":")[1]
     order_data = get_order_raw(order_id)
-    
+
     if not order_data:
         await callback.answer("Заказ не найден", show_alert=True)
         return
-    
+
     # Получаем категорию заказа и проверяем права
     order_category = order_data.get("category")
-    
+
     if not has_permission(user_id, AdminRole.PRODUCTION, order_category):
         category_name = get_category_name(order_category) if order_category else "этого заказа"
         await callback.answer(f"У вас нет прав для обработки заказов категории {category_name}", show_alert=True)
         return
-    
+
     # Обновляем статус
     update_order_status(order_id, OrderStatus.PRODUCTION_STARTED, updated_by=user_id)
-    
+
     # Уведомляем клиента через группированное сообщение
     client_user_id = order_data["user_id"]
     lang = get_user_lang(client_user_id)
     base_order_id = order_data.get("base_order_id") or order_id
     await send_or_update_client_notification(base_order_id, client_user_id, lang)
-    
+
     # Получаем информацию об админе
     admin_name = get_admin_name(user_id)
     admin_info = f"{admin_name} (ID: {user_id})"
     current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
-    
+
     # Обновляем caption
     original_caption = callback.message.caption
     original_caption = re.sub(r'\n📊 Статус:.*?\n━━━━━━━━━━━━━━━━━━━━━━', '', original_caption)
-    
+
     # Извлекаем всю историю
     history_section = re.search(r'━━━━━━━━━━━━━━━━━━━━━━\n(.*)', original_caption, re.DOTALL)
     history_text = history_section.group(1) if history_section else ""
-    
+
     new_caption = (
-        original_caption.split("━━━━━━━━━━━━━━━━━━━━━━")[0] +
-        f"\n📊 Статус: 🏭 Производство начато\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{history_text}\n"
-        f"🏭 Производство начато: {admin_info}\n"
-        f"   Время: {current_time}"
+            original_caption.split("━━━━━━━━━━━━━━━━━━━━━━")[0] +
+            f"\n📊 Статус: 🏭 Производство начато\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{history_text}\n"
+            f"🏭 Производство начато: {admin_info}\n"
+            f"   Время: {current_time}"
     )
-    
+
     # Новые кнопки
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
@@ -2537,7 +2692,7 @@ async def callback_production_started(callback: CallbackQuery):
             callback_data=f"sent_to_warehouse:{order_id}"
         )]
     ])
-    
+
     await callback.message.edit_caption(
         caption=new_caption,
         reply_markup=kb
@@ -2549,53 +2704,53 @@ async def callback_production_started(callback: CallbackQuery):
 async def callback_sent_to_warehouse(callback: CallbackQuery):
     """Передано на склад"""
     user_id = callback.from_user.id
-    
+
     order_id = callback.data.split(":")[1]
     order_data = get_order_raw(order_id)
-    
+
     if not order_data:
         await callback.answer("Заказ не найден", show_alert=True)
         return
-    
+
     # Получаем категорию заказа и проверяем права
     order_category = order_data.get("category")
-    
+
     if not has_permission(user_id, AdminRole.PRODUCTION, order_category):
         category_name = get_category_name(order_category) if order_category else "этого заказа"
         await callback.answer(f"У вас нет прав для обработки заказов категории {category_name}", show_alert=True)
         return
-    
+
     # Обновляем статус
     update_order_status(order_id, OrderStatus.SENT_TO_WAREHOUSE, updated_by=user_id)
-    
+
     # Уведомляем клиента через группированное сообщение
     client_user_id = order_data["user_id"]
     lang = get_user_lang(client_user_id)
     base_order_id = order_data.get("base_order_id") or order_id
     await send_or_update_client_notification(base_order_id, client_user_id, lang)
-    
+
     # Получаем информацию об админе
     admin_name = get_admin_name(user_id)
     admin_info = f"{admin_name} (ID: {user_id})"
     current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
-    
+
     # Обновляем caption
     original_caption = callback.message.caption
     original_caption = re.sub(r'\n📊 Статус:.*?\n━━━━━━━━━━━━━━━━━━━━━━', '', original_caption)
-    
+
     # Извлекаем всю историю
     history_section = re.search(r'━━━━━━━━━━━━━━━━━━━━━━\n(.*)', original_caption, re.DOTALL)
     history_text = history_section.group(1) if history_section else ""
-    
+
     new_caption = (
-        original_caption.split("━━━━━━━━━━━━━━━━━━━━━━")[0] +
-        f"\n📊 Статус: 📦 Передано на склад\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{history_text}\n"
-        f"📦 Передано на склад: {admin_info}\n"
-        f"   Время: {current_time}"
+            original_caption.split("━━━━━━━━━━━━━━━━━━━━━━")[0] +
+            f"\n📊 Статус: 📦 Передано на склад\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{history_text}\n"
+            f"📦 Передано на склад: {admin_info}\n"
+            f"   Время: {current_time}"
     )
-    
+
     # Новые кнопки для склада
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(
@@ -2603,7 +2758,7 @@ async def callback_sent_to_warehouse(callback: CallbackQuery):
             callback_data=f"warehouse_received:{order_id}"
         )]
     ])
-    
+
     await callback.message.edit_caption(
         caption=new_caption,
         reply_markup=kb
@@ -2615,57 +2770,57 @@ async def callback_sent_to_warehouse(callback: CallbackQuery):
 async def callback_warehouse_received(callback: CallbackQuery):
     """Склад получил партию"""
     user_id = callback.from_user.id
-    
+
     if not has_permission(user_id, AdminRole.WAREHOUSE):
         await callback.answer("У вас нет прав", show_alert=True)
         return
-    
+
     order_id = callback.data.split(":")[1]
     order_data = get_order_raw(order_id)
-    
+
     if not order_data:
         await callback.answer("Заказ не найден", show_alert=True)
         return
-    
+
     # Обновляем статус
     update_order_status(order_id, OrderStatus.WAREHOUSE_RECEIVED, updated_by=user_id)
-    
+
     # Уведомляем клиента
     client_user_id = order_data["user_id"]
     lang = get_user_lang(client_user_id)
     category = order_data.get("category")
-    
+
     # НОВОЕ: Отправляем отдельное уведомление о готовности этой категории
     if category:
         await send_category_completion_notification(order_id, category, client_user_id, lang)
-    
+
     # Обновляем группированное сообщение со всеми категориями
     base_order_id = order_data.get("base_order_id") or order_id
     await send_or_update_client_notification(base_order_id, client_user_id, lang)
-    
+
     # Получаем информацию об админе
     admin_name = get_admin_name(user_id)
     admin_info = f"{admin_name} (ID: {user_id})"
     current_time = datetime.now().strftime("%d.%m.%Y %H:%M")
-    
+
     # Обновляем caption - финальный статус
     original_caption = callback.message.caption
     original_caption = re.sub(r'\n📊 Статус:.*?\n━━━━━━━━━━━━━━━━━━━━━━', '', original_caption)
-    
+
     # Извлекаем всю историю
     history_section = re.search(r'━━━━━━━━━━━━━━━━━━━━━━\n(.*)', original_caption, re.DOTALL)
     history_text = history_section.group(1) if history_section else ""
-    
+
     new_caption = (
-        original_caption.split("━━━━━━━━━━━━━━━━━━━━━━")[0] +
-        f"\n📊 Статус: ✅ Получено складом (ГОТОВО)\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"{history_text}\n"
-        f"✅ Получено складом: {admin_info}\n"
-        f"   Время: {current_time}\n\n"
-        f"🎉 Заказ полностью выполнен!"
+            original_caption.split("━━━━━━━━━━━━━━━━━━━━━━")[0] +
+            f"\n📊 Статус: ✅ Получено складом (ГОТОВО)\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n"
+            f"{history_text}\n"
+            f"✅ Получено складом: {admin_info}\n"
+            f"   Время: {current_time}\n\n"
+            f"🎉 Заказ полностью выполнен!"
     )
-    
+
     await callback.message.edit_caption(
         caption=new_caption,
         reply_markup=None
@@ -2680,7 +2835,7 @@ async def cmd_send(message: Message):
     """Отправка сообщения пользователю (только супер-админ)"""
     if message.from_user.id != SUPER_ADMIN_ID:
         return
-    
+
     parts = message.text.split(maxsplit=2)
     if len(parts) < 2:
         await message.answer(
@@ -2690,27 +2845,27 @@ async def cmd_send(message: Message):
             parse_mode="Markdown"
         )
         return
-    
+
     try:
         target_id = int(parts[1])
     except ValueError:
         await message.answer("❌ USER_ID должен быть числом.")
         return
-    
+
     payload = parts[2] if len(parts) > 2 else ""
     ok = False
-    
+
     try:
         if message.photo:
             file_id = message.photo[-1].file_id
             await bot.send_photo(chat_id=target_id, photo=file_id, caption=payload or None)
             ok = True
-        
+
         elif message.video:
             file_id = message.video.file_id
             await bot.send_video(chat_id=target_id, video=file_id, caption=payload or None)
             ok = True
-        
+
         elif message.reply_to_message:
             src = message.reply_to_message
             try:
@@ -2726,18 +2881,18 @@ async def cmd_send(message: Message):
                     ok = True
                 except Exception:
                     ok = False
-        
+
         else:
             if not payload:
                 await message.answer("Нет текста для отправки.")
                 return
             await bot.send_message(target_id, payload)
             ok = True
-    
+
     except Exception:
         logger.exception("Ошибка при отправке /send")
         ok = False
-    
+
     if ok:
         await message.answer(f"✅ Отправлено пользователю {target_id}.")
     else:
@@ -2751,19 +2906,19 @@ async def order_signature_handler(message: Message, state: FSMContext):
         lang = get_user_lang(message.from_user.id)
         sign_name = message.text.strip()
         profile_name = get_user_full_name(message.from_user.id)
-        
+
         if not sign_name:
             if lang == "ru":
                 await message.answer("Пожалуйста, введите имя для подписи.")
             else:
                 await message.answer("Iltimos, imzo uchun ismingizni kiriting.")
             return
-        
+
         # Проверка совпадения с профилем
         if profile_name:
             norm_input = " ".join(sign_name.split()).lower()
             norm_profile = " ".join(profile_name.split()).lower()
-            
+
             if norm_input != norm_profile:
                 if lang == "ru":
                     await message.answer(
@@ -2783,11 +2938,11 @@ async def order_signature_handler(message: Message, state: FSMContext):
             final_name = profile_name
         else:
             final_name = sign_name
-        
+
         # Получаем данные заказа
         data = await state.get_data()
         order_data = data.get("order_data")
-        
+
         if not order_data:
             if lang == "ru":
                 await message.answer("Ошибка: данные заказа не найдены. Начните заново с /start")
@@ -2795,22 +2950,22 @@ async def order_signature_handler(message: Message, state: FSMContext):
                 await message.answer("Xato: buyurtma ma'lumotlari topilmadi. /start dan qayta boshlang")
             await state.clear()
             return
-        
+
         # Генерируем базовый ID заказа (без суффикса)
         base_order_id = f"{datetime.now().strftime('%Y%m%d%H%M%S')}{message.from_user.id % 10000:04d}"
-        
+
         # Получаем координаты клиента
         client_profile = get_user_profile(message.from_user.id)
         client_latitude = client_profile.get("latitude") if client_profile else None
         client_longitude = client_profile.get("longitude") if client_profile else None
-        
+
         # Группируем товары по категориям
         grouped_items = group_items_by_category(order_data["items"])
         num_categories = len(grouped_items)
-        
+
         # Регистрируем заказ
         rate_limiter.register_order(message.from_user.id)
-        
+
         # Отправляем пользователю подтверждение (БЕЗ PDF - он уже получил при предпросмотре)
         if lang == "ru":
             user_text = (
@@ -2832,26 +2987,26 @@ async def order_signature_handler(message: Message, state: FSMContext):
                 f"📋 Savdo bo'limi tez orada buyurtmangizni ko'rib chiqadi.\n"
                 f"Buyurtma holati haqida sizga xabar beramiz."
             )
-        
+
         await message.answer(user_text)
-        
+
         # Отправляем в админ-чат (группу) - отдельные PDF для каждой категории
         profile = get_user_profile(message.from_user.id)
-        
+
         # Формируем строку с координатами
         location_text = ""
         if client_latitude is not None and client_longitude is not None:
             location_text = f"📍 Координаты: {client_latitude:.6f}, {client_longitude:.6f}\n"
-        
+
         # Создаем и отправляем PDF для каждой категории
         part_num = 1
         for category, category_items in sorted(grouped_items.items()):
             # Формируем подномер заказа
             sub_order_id = f"{base_order_id}_{part_num}"
-            
+
             # Вычисляем сумму для этой категории
             category_total = sum(item.get("qty", 0) * item.get("price", 0) for item in category_items)
-            
+
             # Генерируем PDF для этой категории
             pdf_category = generate_order_pdf(
                 order_items=category_items,
@@ -2864,7 +3019,7 @@ async def order_signature_handler(message: Message, state: FSMContext):
                 latitude=client_latitude,
                 longitude=client_longitude
             )
-            
+
             # Сохраняем в БД
             save_order(
                 order_id=sub_order_id,
@@ -2876,10 +3031,10 @@ async def order_signature_handler(message: Message, state: FSMContext):
                 category=category,
                 base_order_id=base_order_id
             )
-            
+
             # Загружаем на хостинг
             await upload_pdf_to_hosting_async(sub_order_id, pdf_category)
-            
+
             # Формируем текст для админов
             category_name = get_category_name(category)
             admin_text = (
@@ -2898,14 +3053,14 @@ async def order_signature_handler(message: Message, state: FSMContext):
                 f"📊 Статус: ⏳ Ожидает одобрения\n"
                 f"━━━━━━━━━━━━━━━━━━━━━━"
             )
-            
+
             kb = InlineKeyboardMarkup(inline_keyboard=[
                 [
                     InlineKeyboardButton(text="✅ Одобрить", callback_data=f"approve:{sub_order_id}"),
                     InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{sub_order_id}")
                 ]
             ])
-            
+
             try:
                 pdf_file = BufferedInputFile(pdf_category, filename=f"order_{sub_order_id}.pdf")
                 await bot.send_document(
@@ -2917,11 +3072,11 @@ async def order_signature_handler(message: Message, state: FSMContext):
                 logger.info(f"Order part {sub_order_id} (category: {category_name}) sent to admin chat {ADMIN_CHAT_ID}")
             except Exception as e:
                 logger.exception(f"Failed to send order part {sub_order_id} to admin chat {ADMIN_CHAT_ID}")
-            
+
             part_num += 1
-        
+
         await state.clear()
-    
+
     except Exception as e:
         logger.exception(f"Error in order signature handler")
         lang = get_user_lang(message.from_user.id)
@@ -2937,17 +3092,17 @@ async def cmd_orders_export(message: Message):
     """Экспорт заказов (только супер-админ)"""
     if message.from_user.id != SUPER_ADMIN_ID:
         return
-    
+
     orders = get_all_orders(limit=10000)
-    
+
     if not orders:
         await message.answer("В базе нет заказов.")
         return
-    
+
     output = io.StringIO()
     writer = csv.writer(output, delimiter=";")
     writer.writerow(["order_id", "client_name", "user_id", "total", "created_at", "status"])
-    
+
     for o in orders:
         writer.writerow([
             o["order_id"],
@@ -2957,13 +3112,13 @@ async def cmd_orders_export(message: Message):
             o["created_at"],
             o["status"] or "",
         ])
-    
+
     csv_bytes = output.getvalue().encode("utf-8-sig")
     output.close()
-    
+
     filename = f"orders_export_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     file = BufferedInputFile(csv_bytes, filename=filename)
-    
+
     await message.answer_document(document=file, caption="Экспорт заказов (CSV)")
 
 
@@ -2972,19 +3127,19 @@ async def cmd_sendall(message: Message):
     """Массовая рассылка (только супер-админ)"""
     if message.from_user.id != SUPER_ADMIN_ID:
         return
-    
+
     text_part = ""
-    
+
     if message.text:
         parts = message.text.split(" ", 1)
         if len(parts) > 1:
             text_part = parts[1].strip()
-    
+
     if message.caption:
         parts = message.caption.split(" ", 1)
         if len(parts) > 1:
             text_part = parts[1].strip()
-    
+
     if not text_part:
         await message.answer(
             "Использование:\n"
@@ -2993,15 +3148,15 @@ async def cmd_sendall(message: Message):
             parse_mode="Markdown"
         )
         return
-    
+
     user_ids = get_all_user_ids()
     if not user_ids:
         await message.answer("Нет пользователей.")
         return
-    
+
     ok = 0
     fail = 0
-    
+
     if message.photo:
         file_id = message.photo[-1].file_id
         for uid in user_ids:
@@ -3012,7 +3167,7 @@ async def cmd_sendall(message: Message):
                 fail += 1
             except Exception:
                 fail += 1
-    
+
     elif message.video:
         file_id = message.video.file_id
         for uid in user_ids:
@@ -3023,7 +3178,7 @@ async def cmd_sendall(message: Message):
                 fail += 1
             except Exception:
                 fail += 1
-    
+
     else:
         for uid in user_ids:
             try:
@@ -3033,7 +3188,7 @@ async def cmd_sendall(message: Message):
                 fail += 1
             except Exception:
                 fail += 1
-    
+
     await message.answer(f"✅ Отправлено: {ok}\n❌ Не доставлено: {fail}")
 
 
@@ -3042,7 +3197,7 @@ async def cmd_get_pdf(message: Message):
     """Получить PDF заказа"""
     user_id = message.from_user.id
     lang = get_user_lang(user_id)
-    
+
     args = message.text.split()
     if len(args) < 2:
         if lang == "ru":
@@ -3050,22 +3205,22 @@ async def cmd_get_pdf(message: Message):
         else:
             await message.answer("Foydalanish: /get_pdf <buyurtma_raqami>")
         return
-    
+
     order_id = args[1].strip()
-    
+
     # Админы могут получать любые заказы
     if user_id in ALL_ADMIN_IDS:
         record = get_order_raw(order_id)
     else:
         record = get_order_for_user(order_id, user_id)
-    
+
     if not record:
         if lang == "ru":
             await message.answer("Заказ не найден.")
         else:
             await message.answer("Buyurtma topilmadi.")
         return
-    
+
     pdf_bytes = record.get("pdf_final") or record.get("pdf_draft")
     if not pdf_bytes:
         if lang == "ru":
@@ -3073,14 +3228,14 @@ async def cmd_get_pdf(message: Message):
         else:
             await message.answer("PDF mavjud emas.")
         return
-    
+
     pdf_file = BufferedInputFile(pdf_bytes, filename=f"order_{order_id}.pdf")
-    
+
     if lang == "ru":
         caption = f"PDF заказа №{order_id}"
     else:
         caption = f"Buyurtma №{order_id} PDF"
-    
+
     await message.answer_document(document=pdf_file, caption=caption)
 
 
@@ -3098,14 +3253,14 @@ async def on_startup(bot: Bot):
     logger.info(f"Rate limiting: ✅")
     logger.info(f"Async FTP: {'✅' if AIOFTP_AVAILABLE else '⚠️  Fallback to sync'}")
     logger.info("=" * 50)
-    
+
     try:
         init_db()
         logger.info("✅ Database initialized")
     except Exception as e:
         logger.exception(f"❌ Database init failed: {e}")
         raise
-    
+
     try:
         await bot.send_message(
             ADMIN_CHAT_ID,
@@ -3132,10 +3287,10 @@ async def on_shutdown(bot: Bot):
 async def main():
     """Главная функция"""
     logger.info("Starting bot initialization...")
-    
+
     dp.startup.register(on_startup)
     dp.shutdown.register(on_shutdown)
-    
+
     try:
         logger.info("Starting polling...")
         await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
