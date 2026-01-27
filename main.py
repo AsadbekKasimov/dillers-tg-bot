@@ -901,7 +901,7 @@ async def send_category_completion_notification(order_id: str, category: str, us
             f"🎉 Полностью готов и ожидает на складе!\n\n"
             f"📦 Товаров: {item_count}\n"
             f"💰 Сумма: {format_currency(order_data.get('total', 0))}\n\n"
-            f"Как только все категории будут готовы, мы сразу отправим ваш заказ!"
+            
         )
     else:
         text = (
@@ -911,7 +911,7 @@ async def send_category_completion_notification(order_id: str, category: str, us
             f"🎉 To'liq tayyor va omborda kutmoqda!\n\n"
             f"📦 Mahsulotlar: {item_count}\n"
             f"💰 Summa: {format_currency(order_data.get('total', 0))}\n\n"
-            f"Barcha kategoriyalar tayyor bo'lgach, buyurtmangizni darhol jo'natamiz!"
+            
         )
     
     try:
