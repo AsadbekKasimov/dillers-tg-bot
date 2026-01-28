@@ -121,11 +121,11 @@ async def refresh_main_menu(user_id: int, state: FSMContext):
 
         # ✅ отправляем новое меню
         menu_text = (
-            "Пожалуйста, вернитесь в главное меню\n"
+            "Пожалуйста, вернитесь в главное меню\n\n"
             "Нажмите кнопку «🏠 Главный меню»"
             if lang == "ru"
             else
-            "Iltimos, bosh menyuga qayting.\n"
+            "Iltimos, bosh menyuga qayting.\n\n"
             "«🏠 Bosh menyu» tugmasini bosing"
         )
 
