@@ -6,3 +6,5 @@ reportlab
 Pillow
 requests
 aioftp
+pymysql
+cryptography
