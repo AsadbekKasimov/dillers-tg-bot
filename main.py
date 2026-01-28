@@ -1749,7 +1749,7 @@ async def cmd_start(message: Message, state: FSMContext):
     # ===== 3. ТЕКСТ ПРОФИЛЯ =====
     if lang == "ru":
         text = (
-            f"Привет{profile['full_name']}!\n\n"
+            f"Привет {profile['full_name']}!\n\n"
             f"Для формление заказа\n"
             f"Нажмите «🛒 Сделать заказ»\n"
 
