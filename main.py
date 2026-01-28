@@ -66,8 +66,9 @@ from reportlab.pdfbase.ttfonts import TTFont
 from PIL import Image
 
 # ==================== КОНФИГУРАЦИЯ ТАЙМЕРА WEBAPP ====================
-# Время активности кнопки "Сделать заказ" в секундах
-WEBAPP_BUTTON_TIMEOUT = 30  # 30 секунд
+
+WEBAPP_BUTTON_TIMEOUT = int(os.getenv("WEBAPP_BUTTON_TIMEOUT", "1800"))
+
 
 # Словарь для хранения времени последнего /start для каждого пользователя
 user_start_times: Dict[int, datetime] = {}
@@ -103,28 +104,42 @@ def get_remaining_time(user_id: int) -> int:
     return max(0, int(remaining))
 
 # 🔄 Принудительное обновление главного меню (для скрытия WebApp)
-async def refresh_main_menu(user_id: int):
+async def refresh_main_menu(user_id: int, state: FSMContext):
+    data = await state.get_data()
+    old_message_id = data.get("menu_message_id")
+
     lang = get_user_lang(user_id)
     kb = get_main_menu_keyboard(user_id, lang)
 
     try:
+        # ❌ удаляем старое меню
+        if old_message_id:
+            await bot.delete_message(
+                chat_id=user_id,
+                message_id=old_message_id
+            )
+
+        # ✅ отправляем новое меню
+        menu_text = (
+            "Пожалуйста, вернитесь в главное меню\n"
+            "Нажмите кнопку «🏠 Главный меню»"
+            if lang == "ru"
+            else
+            "Iltimos, bosh menyuga qayting.\n"
+            "«🏠 Bosh menyu» tugmasini bosing"
+        )
+
         sent = await bot.send_message(
             chat_id=user_id,
-            text="⏳",  # невидимый символ (Word Joiner)
+            text=menu_text,
             reply_markup=kb
         )
 
-        # 🧹 авто-удаление через 1 секунду
-        await asyncio.sleep(3)
-        await bot.delete_message(
-            chat_id=user_id,
-            message_id=sent.message_id
-        )
+        # сохраняем новый message_id
+        await state.update_data(menu_message_id=sent.message_id)
 
     except Exception as e:
         logger.warning(f"Failed to refresh menu for {user_id}: {e}")
-
-# ======================================================================
 
 # ==================== НАСТРОЙКИ АДМИНИСТРАТОРОВ ====================
 
@@ -1140,33 +1155,34 @@ def get_main_menu_keyboard(user_id: int, lang: str):
 
     # ⏳ проверка таймера WebApp
     if is_webapp_button_active(user_id):
-        # ✅ WebApp доступен
+        order_text = "🛒 Сделать заказ" if lang == "ru" else "🛒 Buyurtma berish"
+
         return ReplyKeyboardMarkup(
             keyboard=[
                 [KeyboardButton(
-                    text="🛒 Сделать заказ",
+                    text=order_text,
                     web_app=WebAppInfo(url=WEBAPP_URL)
                 )],
-                [KeyboardButton(text="📋 Мои заказы"), KeyboardButton(text="⚙️ Настройки")]
+                [
+                    KeyboardButton(text="📋 Мои заказы" if lang == "ru" else "📋 Mening buyurtmalarim"),
+                    KeyboardButton(text="⚙️ Настройки" if lang == "ru" else "⚙️ Sozlamalar")
+                ]
             ],
             resize_keyboard=True
         )
     else:
-        # ⛔ WebApp запрещён
-        text = (
-            "Главный меню"
-            if lang == "ru"
-            else "Bosh menyu"
-        )
+        menu_text = "🏠 Главный меню" if lang == "ru" else "🏠 Bosh menyu"
 
         return ReplyKeyboardMarkup(
             keyboard=[
-                [KeyboardButton(text=text)],
-                [KeyboardButton(text="📋 Мои заказы"), KeyboardButton(text="⚙️ Настройки")]
+                [KeyboardButton(text=menu_text)],
+                [
+                    KeyboardButton(text="📋 Мои заказы" if lang == "ru" else "📋 Mening buyurtmalarim"),
+                    KeyboardButton(text="⚙️ Настройки" if lang == "ru" else "⚙️ Sozlamalar")
+                ]
             ],
             resize_keyboard=True
         )
-
 
 
 def get_user_profile(user_id: int) -> Dict[str, str]:
@@ -1690,7 +1706,7 @@ async def cmd_start(message: Message, state: FSMContext):
     # ⏳ Авто-скрытие WebApp кнопки
     async def expire_webapp_keyboard():
         await asyncio.sleep(WEBAPP_BUTTON_TIMEOUT)
-        await refresh_main_menu(user_id)
+        await refresh_main_menu(user_id, state)
 
     asyncio.create_task(expire_webapp_keyboard())
 
@@ -1733,16 +1749,16 @@ async def cmd_start(message: Message, state: FSMContext):
     # ===== 3. ТЕКСТ ПРОФИЛЯ =====
     if lang == "ru":
         text = (
-            f"👤 {profile['full_name']}\n"
-            f"📱 {profile['phone']}\n"
-            f"🏙 {profile['city']}\n\n"
+            f"Привет{profile['full_name']}!\n\n"
+            f"Для формление заказа\n"
+            f"Нажмите «🛒 Сделать заказ»\n"
 
         )
     else:
         text = (
-            f"👤 {profile['full_name']}\n"
-            f"📱 {profile['phone']}\n"
-            f"🏙 {profile['city']}\n\n"
+            f"Salom {profile['full_name']}!\n\n"
+            f"Buyurtma berish uchun \n"
+            f"«🛒 Buyurtma berish» tugmasini bosing\n"
 
         )
 
@@ -1780,16 +1796,14 @@ async def cmd_start(message: Message, state: FSMContext):
     # ===== 5. КЛАВИАТУРА В ЗАВИСИМОСТИ ОТ СТАТУСА =====
     kb = get_main_menu_keyboard(user_id, lang)
 
-    await message.answer(text, reply_markup=kb)
-    await state.clear()
+    sent = await message.answer(
+        text,
+        reply_markup=kb
+    )
 
-    @router.message(F.text.in_([
-        "Главный меню",
-        "Bosh menyu"
-    ]))
-    async def expired_button_as_start(message: Message, state: FSMContext):
-        await cmd_start(message, state)
-        return
+    # ✅ сохраняем message_id меню
+    await state.update_data(menu_message_id=sent.message_id)
+
 
 # ⛔ БЛОКИРОВКА УСТАРЕВШЕЙ КНОПКИ WEBAPP
 @router.message(F.text == "🛒 Сделать заказ")
@@ -2187,6 +2201,9 @@ async def handle_webapp_data(message: Message, state: FSMContext):
     await message.answer_document(document=pdf_file, caption=preview_text)
     await state.set_state(OrderSign.waiting_name)
 
+@router.message(F.text.in_(["🏠 Главный меню", "🏠 Bosh menyu"]))
+async def expired_button_as_start(message: Message, state: FSMContext):
+    await cmd_start(message, state)
 
 @router.message(F.text.in_(["📋 Мои заказы", "📋 Mening buyurtmalarim"]))
 async def cmd_my_orders(message: Message):
