@@ -11,6 +11,11 @@ REQUIRED_ENV = [
     "HOSTING_FTP_HOST",
     "HOSTING_FTP_USER",
     "HOSTING_FTP_PASS",
+    "DB_HOST",
+    "DB_PORT",
+    "DB_NAME",
+    "DB_USER",
+    "DB_PASS",
 ]
 for key in REQUIRED_ENV:
     if not os.getenv(key):
@@ -20,7 +25,8 @@ import json
 import logging
 import asyncio
 import io
-import sqlite3
+import pymysql
+from pymysql.cursors import DictCursor
 import csv
 import re
 from datetime import datetime, timedelta
@@ -66,8 +72,8 @@ from reportlab.pdfbase.ttfonts import TTFont
 from PIL import Image
 
 # ==================== КОНФИГУРАЦИЯ ТАЙМЕРА WEBAPP ====================
-
-WEBAPP_BUTTON_TIMEOUT = int(os.getenv("WEBAPP_BUTTON_TIMEOUT", "1800"))
+# Время активности кнопки "Сделать заказ" в секундах
+WEBAPP_BUTTON_TIMEOUT = int(os.getenv("WEBAPP_BUTTON_TIMEOUT", "300"))
 
 
 # Словарь для хранения времени последнего /start для каждого пользователя
@@ -399,7 +405,19 @@ WEBAPP_URL = os.getenv("WEBAPP_URL")
 USERS_FILE = "users.txt"
 LANG_FILE = "user_lang.json"
 PROFILE_FILE = "user_profile.json"
-DB_PATH = "orders.db"
+
+# MySQL настройки
+DB_CONFIG = {
+    'host': os.getenv("DB_HOST"),
+    'port': int(os.getenv("DB_PORT", "3306")),
+    'user': os.getenv("DB_USER"),
+    'password': os.getenv("DB_PASS"),
+    'database': os.getenv("DB_NAME"),
+    'charset': 'utf8mb4',
+    'cursorclass': DictCursor,
+    'autocommit': False
+}
+
 
 # FTP настройки
 HOSTING_BASE_URL = os.getenv("HOSTING_BASE_URL", "")
@@ -452,6 +470,30 @@ for handler in logging.root.handlers:
     handler.addFilter(secret_filter)
 
 logger = logging.getLogger(__name__)
+
+
+# ==================== MYSQL CONNECTION POOL ====================
+
+from contextlib import contextmanager
+
+@contextmanager
+def get_db_connection():
+    """Контекстный менеджер для MySQL соединения"""
+    connection = None
+    try:
+        connection = pymysql.connect(**DB_CONFIG)
+        yield connection
+        connection.commit()
+    except Exception as e:
+        if connection:
+            connection.rollback()
+        logger.exception(f"Database error: {e}")
+        raise
+    finally:
+        if connection:
+            connection.close()
+
+
 
 
 # ==================== RATE LIMITING MIDDLEWARE ====================
@@ -664,87 +706,160 @@ class OrderDataValidator:
 # ==================== БАЗА ДАННЫХ ====================
 
 def init_db():
-    """Инициализация базы данных с новыми статусами"""
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("""
+    """Инициализация базы данных MySQL с новыми статусами"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        
+        # Создаем таблицу пользователей
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username VARCHAR(255),
+                first_name VARCHAR(255),
+                last_name VARCHAR(255),
+                language VARCHAR(10) DEFAULT 'ru',
+                phone VARCHAR(50),
+                city VARCHAR(255),
+                full_name VARCHAR(255),
+                latitude DECIMAL(10, 7),
+                longitude DECIMAL(10, 7),
+                created_at DATETIME NOT NULL,
+                last_activity DATETIME,
+                INDEX idx_phone (phone),
+                INDEX idx_created_at (created_at)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+        """)
+        
+        # Создаем таблицу заказов
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS orders (
-                order_id TEXT PRIMARY KEY,
-                client_name TEXT NOT NULL,
-                user_id INTEGER NOT NULL,
-                total REAL NOT NULL,
-                created_at TEXT NOT NULL,
-                status TEXT DEFAULT 'pending',
-                pdf_draft BLOB,
-                pdf_final BLOB,
-                order_json TEXT
-            )
+                order_id VARCHAR(50) PRIMARY KEY,
+                client_name VARCHAR(255) NOT NULL,
+                user_id BIGINT NOT NULL,
+                total DECIMAL(15, 2) NOT NULL,
+                created_at DATETIME NOT NULL,
+                status VARCHAR(50) DEFAULT 'pending',
+                pdf_draft LONGBLOB,
+                pdf_final LONGBLOB,
+                order_json TEXT,
+                approved_by BIGINT,
+                production_received_by BIGINT,
+                production_started_by BIGINT,
+                sent_to_warehouse_by BIGINT,
+                warehouse_received_by BIGINT,
+                category VARCHAR(50),
+                base_order_id VARCHAR(50),
+                INDEX idx_user_id (user_id),
+                INDEX idx_status (status),
+                INDEX idx_created_at (created_at),
+                INDEX idx_base_order_id (base_order_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
 
-        # Добавляем новые колонки, если их нет
-        try:
-            c.execute("ALTER TABLE orders ADD COLUMN approved_by INTEGER")
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            c.execute("ALTER TABLE orders ADD COLUMN production_received_by INTEGER")
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            c.execute("ALTER TABLE orders ADD COLUMN production_started_by INTEGER")
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            c.execute("ALTER TABLE orders ADD COLUMN sent_to_warehouse_by INTEGER")
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            c.execute("ALTER TABLE orders ADD COLUMN warehouse_received_by INTEGER")
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            c.execute("ALTER TABLE orders ADD COLUMN category TEXT")
-        except sqlite3.OperationalError:
-            pass
-
-        try:
-            c.execute("ALTER TABLE orders ADD COLUMN base_order_id TEXT")
-        except sqlite3.OperationalError:
-            pass
-
-        # Новая таблица для хранения message_id уведомлений клиента
-        c.execute("""
+        # Создаем таблицу уведомлений клиентов
+        cursor.execute("""
             CREATE TABLE IF NOT EXISTS client_notifications (
-                base_order_id TEXT PRIMARY KEY,
-                user_id INTEGER NOT NULL,
-                message_id INTEGER NOT NULL,
-                created_at TEXT NOT NULL
-            )
+                base_order_id VARCHAR(50) PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                message_id BIGINT NOT NULL,
+                created_at DATETIME NOT NULL,
+                INDEX idx_user_id (user_id)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
         """)
 
         conn.commit()
+        logger.info("✅ Database tables created/verified")
+
+
+def migrate_users_from_files():
+    """Миграция данных пользователей из локальных файлов в базу данных"""
+    try:
+        migrated_count = 0
+        
+        # Миграция user IDs из users.txt
+        if os.path.exists(USERS_FILE):
+            logger.info("Migrating users from users.txt...")
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                user_ids = [int(line.strip()) for line in f if line.strip()]
+            
+            for user_id in user_ids:
+                with get_db_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
+                    if not cursor.fetchone():
+                        cursor.execute("""
+                            INSERT INTO users (user_id, created_at, last_activity, language)
+                            VALUES (%s, %s, %s, %s)
+                        """, (user_id, datetime.now(), datetime.now(), 'ru'))
+                        conn.commit()
+                        migrated_count += 1
+            
+            logger.info(f"Migrated {migrated_count} users from users.txt")
+        
+        # Миграция языков из user_lang.json
+        if os.path.exists(LANG_FILE):
+            logger.info("Migrating languages from user_lang.json...")
+            with open(LANG_FILE, "r", encoding="utf-8") as f:
+                lang_data = json.load(f)
+            
+            for user_id_str, lang in lang_data.items():
+                user_id = int(user_id_str)
+                with get_db_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        UPDATE users SET language = %s WHERE user_id = %s
+                    """, (lang, user_id))
+                    conn.commit()
+            
+            logger.info(f"Migrated languages for {len(lang_data)} users")
+        
+        # Миграция профилей из user_profile.json
+        if os.path.exists(PROFILE_FILE):
+            logger.info("Migrating profiles from user_profile.json...")
+            with open(PROFILE_FILE, "r", encoding="utf-8") as f:
+                profile_data = json.load(f)
+            
+            for user_id_str, profile in profile_data.items():
+                user_id = int(user_id_str)
+                with get_db_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        UPDATE users 
+                        SET phone = %s, city = %s, full_name = %s, latitude = %s, longitude = %s
+                        WHERE user_id = %s
+                    """, (
+                        profile.get('phone'),
+                        profile.get('city'),
+                        profile.get('full_name'),
+                        profile.get('latitude'),
+                        profile.get('longitude'),
+                        user_id
+                    ))
+                    conn.commit()
+            
+            logger.info(f"Migrated profiles for {len(profile_data)} users")
+        
+        logger.info("✅ User data migration completed successfully")
+        
+    except Exception as e:
+        logger.exception("❌ Error during user data migration")
 
 
 def save_order(order_id: str, client_name: str, user_id: int, total: float,
                pdf_draft: bytes, order_json: dict, category: str = None, base_order_id: str = None):
     """Сохранение нового заказа"""
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
-        c.execute("""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
             INSERT INTO orders 
             (order_id, client_name, user_id, total, created_at, status, pdf_draft, order_json, category, base_order_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             order_id,
             client_name,
             user_id,
             total,
-            datetime.now().isoformat(),
+            datetime.now(),
             OrderStatus.PENDING,
             pdf_draft,
             json.dumps(order_json, ensure_ascii=False),
@@ -756,8 +871,8 @@ def save_order(order_id: str, client_name: str, user_id: int, total: float,
 
 def update_order_status(order_id: str, new_status: str, pdf_final: bytes = None, updated_by: int = None):
     """Обновление статуса заказа"""
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
 
         # Определяем, какое поле обновлять
         field_map = {
@@ -769,25 +884,25 @@ def update_order_status(order_id: str, new_status: str, pdf_final: bytes = None,
         }
 
         if pdf_final:
-            c.execute("""
+            cursor.execute("""
                 UPDATE orders 
-                SET status = ?, pdf_final = ?
-                WHERE order_id = ?
+                SET status = %s, pdf_final = %s
+                WHERE order_id = %s
             """, (new_status, pdf_final, order_id))
         else:
-            c.execute("""
+            cursor.execute("""
                 UPDATE orders 
-                SET status = ?
-                WHERE order_id = ?
+                SET status = %s
+                WHERE order_id = %s
             """, (new_status, order_id))
 
         # Обновляем поле с ID администратора
         if updated_by and new_status in field_map:
             field_name = field_map[new_status]
-            c.execute(f"""
+            cursor.execute(f"""
                 UPDATE orders 
-                SET {field_name} = ?
-                WHERE order_id = ?
+                SET {field_name} = %s
+                WHERE order_id = %s
             """, (updated_by, order_id))
 
         conn.commit()
@@ -795,11 +910,10 @@ def update_order_status(order_id: str, new_status: str, pdf_final: bytes = None,
 
 def get_order_raw(order_id: str) -> Optional[Dict[str, Any]]:
     """Получение сырых данных заказа"""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM orders WHERE order_id = ?", (order_id,))
-        row = c.fetchone()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM orders WHERE order_id = %s", (order_id,))
+        row = cursor.fetchone()
         if row:
             return dict(row)
         return None
@@ -807,11 +921,10 @@ def get_order_raw(order_id: str) -> Optional[Dict[str, Any]]:
 
 def get_order_for_user(order_id: str, user_id: int) -> Optional[Dict[str, Any]]:
     """Получение заказа для конкретного пользователя"""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM orders WHERE order_id = ? AND user_id = ?", (order_id, user_id))
-        row = c.fetchone()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM orders WHERE order_id = %s AND user_id = %s", (order_id, user_id))
+        row = cursor.fetchone()
         if row:
             return dict(row)
         return None
@@ -819,62 +932,58 @@ def get_order_for_user(order_id: str, user_id: int) -> Optional[Dict[str, Any]]:
 
 def get_all_orders(limit: int = 100) -> List[Dict[str, Any]]:
     """Получение всех заказов"""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT ?", (limit,))
-        return [dict(row) for row in c.fetchall()]
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM orders ORDER BY created_at DESC LIMIT %s", (limit,))
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def get_user_orders(user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
     """Получение заказов пользователя"""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
             SELECT * FROM orders 
-            WHERE user_id = ? 
+            WHERE user_id = %s 
             ORDER BY created_at DESC 
-            LIMIT ?
+            LIMIT %s
         """, (user_id, limit))
-        return [dict(row) for row in c.fetchall()]
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def get_orders_by_base_id(base_order_id: str) -> List[Dict[str, Any]]:
     """Получение всех под-заказов по базовому ID"""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
             SELECT * FROM orders 
-            WHERE base_order_id = ? OR order_id = ?
+            WHERE base_order_id = %s OR order_id = %s
             ORDER BY order_id
         """, (base_order_id, base_order_id))
-        return [dict(row) for row in c.fetchall()]
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def save_client_notification(base_order_id: str, user_id: int, message_id: int):
     """Сохранение ID сообщения клиенту"""
     with sqlite3.connect(DB_PATH) as conn:
         c = conn.cursor()
-        c.execute("""
+        cursor.execute("""
             INSERT OR REPLACE INTO client_notifications 
             (base_order_id, user_id, message_id, created_at)
-            VALUES (?, ?, ?, ?)
-        """, (base_order_id, user_id, message_id, datetime.now().isoformat()))
+            VALUES (%s, %s, %s, %s)
+        """, (base_order_id, user_id, message_id, datetime.now()))
         conn.commit()
 
 
 def get_client_notification(base_order_id: str) -> Optional[Dict[str, Any]]:
     """Получение ID сообщения клиента"""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
             SELECT * FROM client_notifications 
-            WHERE base_order_id = ?
+            WHERE base_order_id = %s
         """, (base_order_id,))
-        row = c.fetchone()
+        row = cursor.fetchone()
         if row:
             return dict(row)
         return None
@@ -1041,66 +1150,79 @@ async def send_category_completion_notification(order_id: str, category: str, us
 
 # ==================== ПОЛЬЗОВАТЕЛИ ====================
 
-def add_user(user_id: int):
-    """Добавление пользователя в файл"""
+def add_user(user_id: int, username: str = None, first_name: str = None, last_name: str = None):
+    """Добавление/обновление пользователя в базе данных"""
     try:
-        existing = set()
-        if os.path.exists(USERS_FILE):
-            with open(USERS_FILE, "r", encoding="utf-8") as f:
-                existing = set(line.strip() for line in f if line.strip())
-
-        if str(user_id) not in existing:
-            with open(USERS_FILE, "a", encoding="utf-8") as f:
-                f.write(f"{user_id}\n")
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Проверяем, существует ли пользователь
+            cursor.execute("SELECT user_id FROM users WHERE user_id = %s", (user_id,))
+            exists = cursor.fetchone()
+            
+            if exists:
+                # Обновляем last_activity
+                cursor.execute("""
+                    UPDATE users 
+                    SET last_activity = %s, username = %s, first_name = %s, last_name = %s
+                    WHERE user_id = %s
+                """, (datetime.now(), username, first_name, last_name, user_id))
+            else:
+                # Создаем нового пользователя
+                cursor.execute("""
+                    INSERT INTO users (user_id, username, first_name, last_name, created_at, last_activity, language)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                """, (user_id, username, first_name, last_name, datetime.now(), datetime.now(), 'ru'))
+            
+            conn.commit()
+            logger.info(f"User {user_id} added/updated in database")
     except Exception as e:
-        logger.exception(f"Error adding user {user_id}")
+        logger.exception(f"Error adding user {user_id} to database")
 
 
 def get_all_user_ids() -> List[int]:
-    """Получение всех ID пользователей"""
-    if not os.path.exists(USERS_FILE):
-        return []
-
+    """Получение всех ID пользователей из базы данных"""
     try:
-        with open(USERS_FILE, "r", encoding="utf-8") as f:
-            return [int(line.strip()) for line in f if line.strip()]
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT user_id FROM users ORDER BY created_at DESC")
+            return [row['user_id'] for row in cursor.fetchall()]
     except Exception as e:
-        logger.exception("Error reading users file")
+        logger.exception("Error reading users from database")
         return []
 
 
 # ==================== ЯЗЫК ====================
 
 def get_user_lang(user_id: int) -> str:
-    """Получение языка пользователя"""
-    if not os.path.exists(LANG_FILE):
-        return "ru"
-
+    """Получение языка пользователя из базы данных"""
     try:
-        with open(LANG_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data.get(str(user_id), "ru")
-    except:
-        return "ru"
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT language FROM users WHERE user_id = %s", (user_id,))
+            row = cursor.fetchone()
+            if row:
+                return row['language'] or 'ru'
+            return 'ru'
+    except Exception as e:
+        logger.exception(f"Error getting language for user {user_id}")
+        return 'ru'
 
 
 def set_user_lang(user_id: int, lang: str):
-    """Установка языка пользователя"""
-    data = {}
-    if os.path.exists(LANG_FILE):
-        try:
-            with open(LANG_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except:
-            pass
-
-    data[str(user_id)] = lang
-
+    """Установка языка пользователя в базе данных"""
     try:
-        with open(LANG_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE users 
+                SET language = %s 
+                WHERE user_id = %s
+            """, (lang, user_id))
+            conn.commit()
+            logger.info(f"Language for user {user_id} set to {lang}")
     except Exception as e:
-        logger.exception("Error saving language")
+        logger.exception(f"Error saving language for user {user_id}")
 
 
 # ==================== ПРОФИЛЬ ====================
@@ -1186,41 +1308,123 @@ def get_main_menu_keyboard(user_id: int, lang: str):
 
 
 def get_user_profile(user_id: int) -> Dict[str, str]:
-    """Получение профиля пользователя"""
-    if not os.path.exists(PROFILE_FILE):
-        return {}
-
+    """Получение профиля пользователя из базы данных"""
     try:
-        with open(PROFILE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            return data.get(str(user_id), {})
-    except:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT phone, city, full_name, latitude, longitude 
+                FROM users 
+                WHERE user_id = %s
+            """, (user_id,))
+            row = cursor.fetchone()
+            
+            if row:
+                profile = {}
+                if row['phone']:
+                    profile['phone'] = row['phone']
+                if row['city']:
+                    profile['city'] = row['city']
+                if row['full_name']:
+                    profile['full_name'] = row['full_name']
+                if row['latitude']:
+                    profile['latitude'] = float(row['latitude'])
+                if row['longitude']:
+                    profile['longitude'] = float(row['longitude'])
+                return profile
+            return {}
+    except Exception as e:
+        logger.exception(f"Error getting profile for user {user_id}")
         return {}
 
 
 def set_user_profile(user_id: int, profile: Dict[str, str]):
-    """Сохранение профиля пользователя"""
-    data = {}
-    if os.path.exists(PROFILE_FILE):
-        try:
-            with open(PROFILE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except:
-            pass
-
-    data[str(user_id)] = profile
-
+    """Сохранение профиля пользователя в базе данных"""
     try:
-        with open(PROFILE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Получаем данные из профиля
+            phone = profile.get('phone')
+            city = profile.get('city')
+            full_name = profile.get('full_name')
+            latitude = profile.get('latitude')
+            longitude = profile.get('longitude')
+            
+            # Обновляем профиль пользователя
+            cursor.execute("""
+                UPDATE users 
+                SET phone = %s, city = %s, full_name = %s, latitude = %s, longitude = %s
+                WHERE user_id = %s
+            """, (phone, city, full_name, latitude, longitude, user_id))
+            
+            conn.commit()
+            logger.info(f"Profile for user {user_id} updated in database")
     except Exception as e:
-        logger.exception("Error saving profile")
+        logger.exception(f"Error saving profile for user {user_id}")
 
 
 def get_user_full_name(user_id: int) -> Optional[str]:
     """Получение полного имени пользователя из профиля"""
     profile = get_user_profile(user_id)
     return profile.get("full_name")
+
+
+def get_user_info(user_id: int) -> Optional[Dict[str, Any]]:
+    """Получение полной информации о пользователе"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT user_id, username, first_name, last_name, language, 
+                       phone, city, full_name, latitude, longitude, 
+                       created_at, last_activity
+                FROM users 
+                WHERE user_id = %s
+            """, (user_id,))
+            row = cursor.fetchone()
+            if row:
+                return dict(row)
+            return None
+    except Exception as e:
+        logger.exception(f"Error getting user info for {user_id}")
+        return None
+
+
+def get_users_stats() -> Dict[str, Any]:
+    """Получение статистики пользователей"""
+    try:
+        with get_db_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Общее количество пользователей
+            cursor.execute("SELECT COUNT(*) as total FROM users")
+            total = cursor.fetchone()['total']
+            
+            # Активные пользователи (за последние 30 дней)
+            cursor.execute("""
+                SELECT COUNT(*) as active 
+                FROM users 
+                WHERE last_activity >= DATE_SUB(NOW(), INTERVAL 30 DAY)
+            """)
+            active = cursor.fetchone()['active']
+            
+            # Новые пользователи (за последние 7 дней)
+            cursor.execute("""
+                SELECT COUNT(*) as new_users 
+                FROM users 
+                WHERE created_at >= DATE_SUB(NOW(), INTERVAL 7 DAY)
+            """)
+            new_users = cursor.fetchone()['new_users']
+            
+            return {
+                'total': total,
+                'active_30d': active,
+                'new_7d': new_users
+            }
+    except Exception as e:
+        logger.exception("Error getting users stats")
+        return {'total': 0, 'active_30d': 0, 'new_7d': 0}
 
 
 # ==================== FTP ====================
@@ -1698,7 +1902,12 @@ async def cmd_start(message: Message, state: FSMContext):
     """Команда /start с перепроверкой дилера"""
 
     user_id = message.from_user.id
-    add_user(user_id)
+    username = message.from_user.username
+    first_name = message.from_user.first_name
+    last_name = message.from_user.last_name
+    
+    # Регистрируем пользователя с полной информацией из Telegram
+    add_user(user_id, username, first_name, last_name)
 
     # ===== ОБНОВЛЕНИЕ ТАЙМЕРА WEBAPP =====
     update_user_start_time(user_id)
@@ -2211,17 +2420,16 @@ async def cmd_my_orders(message: Message):
     user_id = message.from_user.id
     lang = get_user_lang(user_id)
 
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        c = conn.cursor()
-        c.execute("""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
             SELECT order_id, total, status, created_at 
             FROM orders 
-            WHERE user_id = ? 
+            WHERE user_id = %s 
             ORDER BY created_at DESC 
             LIMIT 10
         """, (user_id,))
-        orders = [dict(row) for row in c.fetchall()]
+        orders = [dict(row) for row in cursor.fetchall()]
 
     if not orders:
         if lang == "ru":
@@ -2249,7 +2457,7 @@ async def cmd_my_orders(message: Message):
         status = status_names.get(order["status"], order["status"])
         text += f"№{order['order_id']}\n"
         text += f"💰 {format_currency(order['total'])}\n"
-        text += f"📅 {order['created_at'][:10]}\n"
+        text += f"📅 {order['created_at'].strftime('%Y-%m-%d') if isinstance(order['created_at'], datetime) else str(order['created_at'])[:10]}\n"
         text += f"📊 {status}\n\n"
 
     await message.answer(text)
@@ -3139,6 +3347,24 @@ async def cmd_orders_export(message: Message):
     await message.answer_document(document=file, caption="Экспорт заказов (CSV)")
 
 
+@router.message(Command("users_stats"))
+async def cmd_users_stats(message: Message):
+    """Статистика пользователей (только супер-админ)"""
+    if message.from_user.id != SUPER_ADMIN_ID:
+        return
+    
+    stats = get_users_stats()
+    
+    text = (
+        "📊 Статистика пользователей:\n\n"
+        f"👥 Всего пользователей: {stats['total']}\n"
+        f"🟢 Активных (30 дней): {stats['active_30d']}\n"
+        f"✨ Новых (7 дней): {stats['new_7d']}\n"
+    )
+    
+    await message.answer(text)
+
+
 @router.message(Command("sendall"))
 async def cmd_sendall(message: Message):
     """Массовая рассылка (только супер-админ)"""
@@ -3268,12 +3494,16 @@ async def on_startup(bot: Bot):
     logger.info(f"Production Admins: {PRODUCTION_ADMIN_IDS}")
     logger.info(f"Warehouse Admins: {WAREHOUSE_ADMIN_IDS}")
     logger.info(f"Rate limiting: ✅")
+    logger.info(f"Database: MySQL at {DB_CONFIG['host']}:{DB_CONFIG['port']}")
     logger.info(f"Async FTP: {'✅' if AIOFTP_AVAILABLE else '⚠️  Fallback to sync'}")
     logger.info("=" * 50)
 
     try:
         init_db()
         logger.info("✅ Database initialized")
+        
+        # Миграция данных из локальных файлов в БД
+        migrate_users_from_files()
     except Exception as e:
         logger.exception(f"❌ Database init failed: {e}")
         raise
