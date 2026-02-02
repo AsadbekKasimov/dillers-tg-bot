@@ -584,7 +584,41 @@ rate_limiter = RateLimitMiddleware(
     admin_ids=ALL_ADMIN_IDS
 )
 
+# ==================== WEBAPP TIMER MIDDLEWARE ====================
 
+class WebAppTimerMiddleware(BaseMiddleware):
+    """Middleware для проверки активности кнопки WebApp"""
+
+    async def __call__(
+            self,
+            handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+            event: TelegramObject,
+            data: Dict[str, Any]
+    ) -> Any:
+        # Проверяем, является ли событие сообщением с web_app_data
+        if isinstance(event, Message) and event.web_app_data:
+            user_id = event.from_user.id
+            logger.info(f"[TIMER MIDDLEWARE] WebApp data received from user {user_id}")
+
+            # Проверяем, активна ли кнопка
+            if not is_webapp_button_active(user_id):
+                logger.warning(f"[TIMER MIDDLEWARE] BLOCKING WebApp for user {user_id} - timer expired!")
+
+                # Отправляем сообщение без определения языка (или используем русский по умолчанию)
+                await event.answer(
+                    "⏰ Время действия кнопки истекло.\n"
+                    "Пожалуйста, нажмите /start для создания нового заказа.\n\n"
+                    "⏰ Tugma faolligi tugadi.\n"
+                    "Iltimos, yangi buyurtma yaratish uchun /start ni bosing.",
+                    reply_markup=ReplyKeyboardRemove()
+                )
+
+                return  # Прерываем обработку
+
+            logger.info(f"[TIMER MIDDLEWARE] ALLOWING WebApp for user {user_id} - timer active")
+
+        # Продолжаем обработку
+        return await handler(event, data)
 
 
 
