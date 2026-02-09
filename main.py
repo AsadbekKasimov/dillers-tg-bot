@@ -38,6 +38,10 @@ from typing import Optional, Dict, Any, List
 from urllib.request import urlopen
 from urllib.error import URLError, HTTPError
 import aiohttp  # ✅ НОВОЕ: для асинхронных запросов к Google Sheets
+from concurrent.futures import ThreadPoolExecutor
+
+# Создаем пул потоков для параллельной загрузки изображений
+image_download_executor = ThreadPoolExecutor(max_workers=10)
 
 from aiogram import Bot, Dispatcher, Router, F
 from aiogram.filters import Command
@@ -77,7 +81,13 @@ from PIL import Image
 GOOGLE_SHEETS_URL = os.getenv("GOOGLE_SHEETS_URL")
 products_cache = {}  # Кеш товаров
 cache_timestamp = None
-CACHE_LIFETIME = 300  # 5 минут
+CACHE_LIFETIME = 3600  # 5 минут
+
+# Кеш изображений товаров
+image_cache = {}  # {url: PIL.Image}
+image_cache_timestamp = {}  # {url: datetime}
+IMAGE_CACHE_LIFETIME = 3600  # 1 час
+
 
 async def fetch_products_from_sheets():
     """Асинхронная загрузка товаров из Google Sheets"""
@@ -1576,28 +1586,92 @@ def wrap_text(text: str, max_chars: int):
     return wrapper.wrap(text)
 
 
+async def download_image_async(url: str, timeout: int = 10) -> Optional[Image.Image]:
+    """Асинхронная загрузка изображения с кешированием"""
+    global image_cache, image_cache_timestamp
+    
+    # Проверяем кеш
+    if url in image_cache:
+        cache_age = (datetime.now() - image_cache_timestamp.get(url, datetime.now())).total_seconds()
+        if cache_age < IMAGE_CACHE_LIFETIME:
+            logger.debug(f"Image cache HIT: {url}")
+            return image_cache[url]
+    
+    try:
+        loop = asyncio.get_event_loop()
+        
+        def _download():
+            try:
+                response = urlopen(url, timeout=timeout)
+                image_data = response.read()
+                return Image.open(io.BytesIO(image_data))
+            except Exception as e:
+                logger.warning(f"Failed to download image from {url}: {e}")
+                return None
+        
+        image = await loop.run_in_executor(image_download_executor, _download)
+        
+        if image:
+            image_cache[url] = image
+            image_cache_timestamp[url] = datetime.now()
+            logger.debug(f"Image downloaded and cached: {url}")
+        
+        return image
+    except Exception as e:
+        logger.warning(f"Error downloading image async: {e}")
+        return None
+
+
+# Оставляем старую функцию для совместимости
 def download_image(url: str, timeout: int = 10) -> Optional[Image.Image]:
-    """Скачивает изображение по URL"""
+    """Синхронная версия (deprecated)"""
     try:
         response = urlopen(url, timeout=timeout)
         image_data = response.read()
-        image = Image.open(io.BytesIO(image_data))
-        return image
+        return Image.open(io.BytesIO(image_data))
     except (URLError, HTTPError, Exception) as e:
         logger.warning(f"Failed to download image from {url}: {e}")
         return None
 
 
+async def preload_order_images(order_items: list) -> Dict[str, Image.Image]:
+    """
+    Параллельная предзагрузка всех изображений для заказа
+    """
+    image_urls = []
+    
+    for item in order_items:
+        image_url = item.get("image", "")
+        if image_url and image_url not in image_urls:
+            image_urls.append(image_url)
+    
+    if not image_urls:
+        return {}
+    
+    logger.info(f"⚡ Preloading {len(image_urls)} unique images in parallel...")
+    
+    tasks = [download_image_async(url, timeout=5) for url in image_urls]
+    images = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    result = {}
+    for url, image in zip(image_urls, images):
+        if image and not isinstance(image, Exception):
+            result[url] = image
+    
+    logger.info(f"✅ Preloaded {len(result)} images successfully")
+    return result
+
 def generate_order_pdf(
-        order_items,
-        total,
-        client_name,
-        admin_name,
-        order_id,
-        approved: bool = False,
-        category: str = None,
-        latitude: float = None,
-        longitude: float = None
+    order_items: list,
+    total: int,
+    client_name: str,
+    admin_name: str,
+    order_id: str,
+    approved: bool = False,
+    category: Optional[str] = None,
+    latitude: Optional[float] = None,
+    longitude: Optional[float] = None,
+    preloaded_images: Optional[Dict[str, Image.Image]] = None  # ✅ НОВЫЙ ПАРАМЕТР
 ) -> bytes:
     """Генерирует PDF заказа с фотографиями товаров"""
     buffer = io.BytesIO()
@@ -1610,13 +1684,16 @@ def generate_order_pdf(
     bottom_margin = 18 * mm
     usable_width = width - left_margin - right_margin
 
-    # Колонки (с учетом изображения)
-    col_image_w = 25 * mm  # НОВОЕ: ширина для изображения
-    col_id_w = usable_width * 0.08  # ДОБАВЛЕНО: ширина для ID
-    col_name_w = usable_width * 0.32  # Уменьшено для ID
-    col_qty_w = usable_width * 0.10
-    col_price_w = usable_width * 0.17
-    col_sum_w = usable_width * 0.18
+    # ✅ ОБНОВЛЁННЫЕ КОЛОНКИ: №, Фото, ID, Наименование, Кол-во, Вес, Куб, Цена, Сумма
+    col_num_w = usable_width * 0.04  # № (номер)
+    col_image_w = 20 * mm  # Фото (уменьшено)
+    col_id_w = usable_width * 0.07  # ID
+    col_name_w = usable_width * 0.22  # Наименование (уменьшено)
+    col_qty_w = usable_width * 0.08  # Кол-во
+    col_weight_w = usable_width * 0.09  # Вес
+    col_cube_w = usable_width * 0.09  # Куб
+    col_price_w = usable_width * 0.13  # Цена
+    col_sum_w = usable_width * 0.14  # Сумма
 
     header_font = "DejaVu" if "DejaVu" in pdfmetrics.getRegisteredFontNames() else "Helvetica"
     main_font = header_font
@@ -1729,23 +1806,40 @@ def generate_order_pdf(
     c.drawString(table_x, y, "Товары / Mahsulotlar")
     y -= 6 * mm
 
-    c.setFont(main_font, 9)
+    # ✅ НОВЫЕ ЗАГОЛОВКИ: №, Фото, ID, Наименование, Кол-во, Вес, Куб, Цена, Сумма
+    c.setFont(main_font, 7)  # Уменьшенный шрифт для заголовков
     header_y = y
-    # ИЗМЕНЕНО: Добавлен заголовок "Фото" и "ID"
-    c.drawString(table_x, header_y, "Фото")
-    c.drawString(table_x + col_image_w, header_y, "ID")
-    c.drawString(table_x + col_image_w + col_id_w, header_y, "Наименование")
-    c.drawRightString(table_x + col_image_w + col_id_w + col_name_w + col_qty_w, header_y, "Кол-во")
-    c.drawRightString(table_x + col_image_w + col_id_w + col_name_w + col_qty_w + col_price_w, header_y, "Цена")
-    c.drawRightString(table_x + col_image_w + col_id_w + col_name_w + col_qty_w + col_price_w + col_sum_w, header_y,
-                      "Сумма")
+
+    c.drawString(table_x, header_y, "№")
+    c.drawString(table_x + col_num_w, header_y, "Фото")
+    c.drawString(table_x + col_num_w + col_image_w, header_y, "ID")
+    c.drawString(table_x + col_num_w + col_image_w + col_id_w, header_y, "Наименование")
+    c.drawRightString(table_x + col_num_w + col_image_w + col_id_w + col_name_w + col_qty_w, header_y, "Кол-во")
+    c.drawRightString(table_x + col_num_w + col_image_w + col_id_w + col_name_w + col_qty_w + col_weight_w, header_y,
+                      "Вес")
+    c.drawRightString(table_x + col_num_w + col_image_w + col_id_w + col_name_w + col_qty_w + col_weight_w + col_cube_w,
+                      header_y, "Куб")
+    c.drawRightString(
+        table_x + col_num_w + col_image_w + col_id_w + col_name_w + col_qty_w + col_weight_w + col_cube_w + col_price_w,
+        header_y, "Цена")
+    c.drawRightString(
+        table_x + col_num_w + col_image_w + col_id_w + col_name_w + col_qty_w + col_weight_w + col_cube_w + col_price_w + col_sum_w,
+        header_y, "Сумма")
+
+
     y -= 5 * mm
     c.line(table_x, y + 3 * mm, width - right_margin, y + 3 * mm)
     y -= 4 * mm
 
-    c.setFont(main_font, 9)
-    line_height = 5.8 * mm
-    max_name_chars = 30  # Уменьшено из-за изображения
+    c.setFont(main_font, 7)  # Уменьшенный шрифт для содержимого
+    line_height = 5.5 * mm
+    max_name_chars = 18  # Уменьшено из-за дополнительных колонок
+
+    # ✅ ПЕРЕМЕННЫЕ ДЛЯ ИТОГОВ
+    total_weight = 0.0
+    total_cube = 0.0
+    item_number = 1  # Счётчик для нумерации товаров
+
 
     for item in order_items:
         name_raw = str(item.get("name", "Неизвестно"))
@@ -1753,44 +1847,66 @@ def generate_order_pdf(
         price = int(item.get("price", 0) or 0)
         image_url = item.get("image", "")  # НОВОЕ: Получаем URL изображения
         product_id = str(item.get("id", ""))  # ДОБАВЛЕНО: Получаем ID продукта
+        weight = float(item.get("weight", 0) or 0)  # вес одной единицы
+        cube = float(item.get("cube", 0) or 0)  # куб одной единицы
 
         if qty <= 0 and price == 0:
             continue
 
         sum_item = qty * price
+
+        # ✅ ВЫЧИСЛЯЕМ ИТОГОВЫЕ ВЕС И КУБ ДЛЯ ЭТОЙ ПОЗИЦИИ
+        item_total_weight = weight * qty
+        item_total_cube = cube * qty
+
+        # ✅ НАКАПЛИВАЕМ ОБЩИЕ ИТОГИ
+        total_weight += item_total_weight
+        total_cube += item_total_cube
+
         name_lines = wrap_text(name_raw, max_name_chars)
 
         # НОВОЕ: Определяем высоту с учетом изображения
-        image_height = 20 * mm if image_url else 0
+        image_height = 18 * mm if image_url else 0
         text_height = line_height * max(1, len(name_lines))
         needed_height = max(image_height, text_height)
 
         if y - needed_height < bottom_margin + 30 * mm:
             new_page()
 
-        # ИСПРАВЛЕНО: Вычисляем центральную позицию для выравнивания всех элементов
-        # Центр строки находится посередине между верхом и низом
+        # Центр строки
         row_center_y = y - (needed_height / 2)
 
-        # НОВОЕ: Рисуем изображение товара (выровнено по центру)
+        # ✅ РИСУЕМ НОМЕР СТРОКИ
+        c.drawString(table_x, row_center_y - 1 * mm, str(item_number))
+        item_number += 1
+
+        # ✅ РИСУЕМ ИЗОБРАЖЕНИЕ ТОВАРА
+               # ✅ РИСУЕМ ИЗОБРАЖЕНИЕ ТОВАРА
         if image_url:
             try:
-                product_image = download_image(image_url, timeout=5)
+                product_image = None
+
+                if preloaded_images and image_url in preloaded_images:
+                    product_image = preloaded_images[image_url]
+                    logger.debug("Using preloaded image")
+                else:
+                    product_image = download_image(image_url, timeout=5)
+
                 if product_image:
                     # Конвертируем в RGB если необходимо
-                    if product_image.mode != 'RGB':
-                        product_image = product_image.convert('RGB')
+                    if product_image.mode != "RGB":
+                        product_image = product_image.convert("RGB")
 
                     # Создаем ImageReader из PIL Image
                     img_buffer = io.BytesIO()
-                    product_image.save(img_buffer, format='JPEG')
+                    product_image.save(img_buffer, format="JPEG")
                     img_buffer.seek(0)
                     img_reader = ImageReader(img_buffer)
 
                     # Рисуем изображение с центрированием по вертикали
-                    img_size = 18 * mm
-                    img_x = table_x + 1 * mm
-                    img_y = row_center_y - (img_size / 2)  # ИСПРАВЛЕНО: центрирование
+                    img_size = 16 * mm
+                    img_x = table_x + col_num_w + 1 * mm
+                    img_y = row_center_y - (img_size / 2)
 
                     c.drawImage(
                         img_reader,
@@ -1801,20 +1917,19 @@ def generate_order_pdf(
                         preserveAspectRatio=True,
                         mask="auto"
                     )
+
             except Exception as e:
                 logger.warning(f"Could not add image to PDF: {e}")
 
-        # ИСПРАВЛЕНО: Рисуем ID продукта (выровнено по центру)
-        if product_id:
-            id_x = table_x + col_image_w
-            c.setFont(main_font, 8)
-            # Центрируем ID по вертикали относительно строки
-            c.drawString(id_x, row_center_y - 1 * mm, product_id)  # ИСПРАВЛЕНО: центрирование
-            c.setFont(main_font, 9)
 
-        # ИСПРАВЛЕНО: Рисуем название товара (выровнено по центру)
-        name_x = table_x + col_image_w + col_id_w
-        # Вычисляем стартовую позицию для центрирования текста
+        # ✅ РИСУЕМ ID ПРОДУКТА
+        if product_id:
+            id_x = table_x + col_num_w + col_image_w
+            c.setFont(main_font, 7)
+            c.drawString(id_x, row_center_y - 1 * mm, product_id)
+
+        # ✅ РИСУЕМ НАЗВАНИЕ ТОВАРА
+        name_x = table_x + col_num_w + col_image_w + col_id_w
         total_text_height = line_height * len(name_lines)
         text_start_y = row_center_y + (total_text_height / 2) - (line_height / 2)
 
@@ -1823,25 +1938,44 @@ def generate_order_pdf(
             c.drawString(name_x, cur_y, ln)
             cur_y -= line_height
 
-        # ИСПРАВЛЕНО: Рисуем количество, цену и сумму (выровнено по центру)
-        qty_x = table_x + col_image_w + col_id_w + col_name_w
-        price_x = qty_x + col_qty_w
+        # ✅ РИСУЕМ КОЛИЧЕСТВО, ВЕС, КУБ, ЦЕНУ И СУММУ
+        qty_x = table_x + col_num_w + col_image_w + col_id_w + col_name_w
+        weight_x = qty_x + col_qty_w
+        cube_x = weight_x + col_weight_w
+        price_x = cube_x + col_cube_w
         sum_x = price_x + col_price_w
 
-        # Центрируем числовые данные по вертикали
-        numbers_y = row_center_y - 1 * mm  # ИСПРАВЛЕНО: центрирование
+        numbers_y = row_center_y - 1 * mm
         c.drawRightString(qty_x + col_qty_w - 2 * mm, numbers_y, str(qty))
+        c.drawRightString(weight_x + col_weight_w - 2 * mm, numbers_y, f"{item_total_weight:.2f}")
+        c.drawRightString(cube_x + col_cube_w - 2 * mm, numbers_y, f"{item_total_cube:.4f}")
         c.drawRightString(price_x + col_price_w - 2 * mm, numbers_y, format_currency(price))
         c.drawRightString(sum_x + col_sum_w - 2 * mm, numbers_y, format_currency(sum_item))
 
         y = y - needed_height - (2 * mm)
 
     # Итог
-    if y - 20 * mm < bottom_margin:
+    # ✅ ИТОГИ: Общий вес, общий куб и общая сумма
+    if y - 25 * mm < bottom_margin:
         new_page()
 
     y -= 4 * mm
-    c.setFont(main_font, 11)
+    c.line(table_x, y + 3 * mm, width - right_margin, y + 3 * mm)
+    y -= 6 * mm
+
+    c.setFont(main_font, 10)
+
+    # Выводим общий вес
+    c.drawRightString(width - right_margin - (qr_size + 4 * mm if qr_reader else 0), y,
+                      f"Общий вес: {total_weight:.2f} кг")
+    y -= 6 * mm
+
+    # Выводим общий куб
+    c.drawRightString(width - right_margin - (qr_size + 4 * mm if qr_reader else 0), y,
+                      f"Общий куб: {total_cube:.4f} м³")
+    y -= 6 * mm
+
+    # Выводим общую сумму
     c.drawRightString(width - right_margin - (qr_size + 4 * mm if qr_reader else 0), y,
                       f"Итого: {format_currency(total)}")
     y -= 12 * mm
@@ -2453,7 +2587,9 @@ async def handle_webapp_data(message: Message, state: FSMContext):
                 "price": int(product.get("price", 0)),
                 "qty": qty,
                 "image": product.get("image", ""),
-                "category": product.get("category", "unknown")
+                "category": product.get("category", "unknown"),
+                "weight": float(product.get("weight", 0)),
+                "cube": float(product.get("cube", 0))
             }
             
             enriched_items.append(enriched_item)
@@ -2492,8 +2628,11 @@ async def handle_webapp_data(message: Message, state: FSMContext):
     is_multi_category = len(grouped_items) > 1
 
     try:
-        # Для клиента всегда генерируем один PDF со всеми товарами
-        pdf_preview = generate_order_pdf(
+        # ✅ Предзагружаем все изображения параллельно
+        preloaded_images = await preload_order_images(validated_data["items"])
+        
+        pdf_preview = await asyncio.to_thread(
+            generate_order_pdf,
             order_items=validated_data["items"],
             total=validated_data["total"],
             client_name=profile_name,
@@ -2502,8 +2641,10 @@ async def handle_webapp_data(message: Message, state: FSMContext):
             approved=False,
             category=None if is_multi_category else get_order_category(validated_data["items"]),
             latitude=client_latitude,
-            longitude=client_longitude
+            longitude=client_longitude,
+            preloaded_images=preloaded_images  # ✅ ПЕРЕДАЕМ
         )
+
     except Exception as e:
         logger.exception(f"PDF generation error for user {user_id}")
         if lang == "ru":
@@ -2718,16 +2859,20 @@ async def callback_approve_order_confirmed(callback: CallbackQuery):
 
     # Генерируем финальный PDF
     order_json = json.loads(order_data["order_json"])
-    pdf_final = generate_order_pdf(
-        order_items=order_json["items"],
-        total=order_json["total"],
-        client_name=order_data["client_name"],
+    preloaded_images = await preload_order_images(validated_data["items"])
+    
+    pdf_final = await asyncio.to_thread(
+        generate_order_pdf,
+        order_items=validated_data["items"],
+        total=validated_data["total"],
+        client_name=client_name,
         admin_name=ADMIN_NAME,
         order_id=order_id,
         approved=True,
-        category=order_category,
+        category=None if is_multi_category else get_order_category(validated_data["items"]),
         latitude=client_latitude,
-        longitude=client_longitude
+        longitude=client_longitude,
+        preloaded_images=preloaded_images
     )
 
     # Обновляем статус
@@ -3367,18 +3512,22 @@ async def order_signature_handler(message: Message, state: FSMContext):
             category_total = sum(item.get("qty", 0) * item.get("price", 0) for item in category_items)
 
             # Генерируем PDF для этой категории
-            pdf_category = generate_order_pdf(
+            
+            sub_preloaded = await preload_order_images(category_items)
+            
+            pdf_category = await asyncio.to_thread(
+                generate_order_pdf,
                 order_items=category_items,
-                total=category_total,
-                client_name=final_name,
+                total=sub_total,
+                client_name=client_name,
                 admin_name=ADMIN_NAME,
                 order_id=sub_order_id,
-                approved=False,
-                category=category,
+                approved=True,
+                category=cat,
                 latitude=client_latitude,
-                longitude=client_longitude
+                longitude=client_longitude,
+                preloaded_images=sub_preloaded
             )
-
             # Сохраняем в БД
             save_order(
                 order_id=sub_order_id,
@@ -3642,18 +3791,13 @@ async def on_startup(bot: Bot):
         logger.exception(f"❌ Database init failed: {e}")
         raise
 
+    # ✅ Предзагружаем товары в кеш
     try:
-        await bot.send_message(
-            ADMIN_CHAT_ID,
-            "🤖 Бот запущен с многоуровневой системой администрирования!\n\n"
-            f"Супер-админ: 1\n"
-            f"Отдел продаж: {len(SALES_ADMIN_IDS)}\n"
-            f"Отдел производства: {len(PRODUCTION_ADMIN_IDS)}\n"
-            f"Склад: {len(WAREHOUSE_ADMIN_IDS)}\n\n"
-            f"✨ Группировка уведомлений клиентов активирована!"
-        )
+        products = await fetch_products_from_sheets()
+        logger.info(f"✅ Pre-loaded {len(products)} products into cache")
     except Exception as e:
-        logger.warning(f"Cannot notify admin: {e}")
+        logger.warning(f"⚠️ Failed to pre-load products: {e}")
+
 
 
 async def on_shutdown(bot: Bot):
@@ -3664,6 +3808,17 @@ async def on_shutdown(bot: Bot):
     except:
         pass
 
+async def background_cache_updater():
+    """Фоновое обновление кеша товаров"""
+    await asyncio.sleep(60)  # Подождать 1 минуту после старта
+    
+    while True:
+        try:
+            await asyncio.sleep(1800)  # 30 минут
+            products = await fetch_products_from_sheets()
+            logger.info(f"🔄 Background cache update: {len(products)} products")
+        except Exception as e:
+            logger.exception(f"❌ Background cache update failed: {e}")
 
 async def main():
     """Главная функция"""
