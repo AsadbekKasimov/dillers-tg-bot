@@ -1621,6 +1621,42 @@ async def download_image_async(url: str, timeout: int = 10) -> Optional[Image.Im
         logger.warning(f"Error downloading image async: {e}")
         return None
 
+def compress_image_for_pdf(
+    img: Image.Image,
+    max_size: int = 420,
+    quality: int = 65
+) -> Optional[ImageReader]:
+    """
+    ⚡ Быстрое сжатие изображения для PDF
+    Возвращает ImageReader
+    """
+
+    try:
+        # 🔥 ДЕЛАЕМ КОПИЮ — чтобы не ломать кеш
+        img_copy = img.copy()
+
+        img_copy.thumbnail((max_size, max_size), Image.LANCZOS)
+
+        if img_copy.mode != "RGB":
+            img_copy = img_copy.convert("RGB")
+
+        buf = io.BytesIO()
+
+        img_copy.save(
+            buf,
+            format="JPEG",
+            quality=quality,
+            optimize=True,
+            progressive=True
+        )
+
+        buf.seek(0)
+        return ImageReader(buf)
+
+    except Exception as e:
+        logger.warning(f"Image compression failed: {e}")
+        return None
+        
 
 # Оставляем старую функцию для совместимости
 def download_image(url: str, timeout: int = 10) -> Optional[Image.Image]:
@@ -1676,6 +1712,8 @@ def generate_order_pdf(
     """Генерирует PDF заказа с фотографиями товаров"""
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=A4)
+    # 🔥 Внутреннее сжатие PDF
+    c.setPageCompression(1)
     width, height = A4
 
     left_margin = 15 * mm
@@ -1882,28 +1920,23 @@ def generate_order_pdf(
 
         # ✅ РИСУЕМ ИЗОБРАЖЕНИЕ ТОВАРА
                # ✅ РИСУЕМ ИЗОБРАЖЕНИЕ ТОВАРА
+        
         if image_url:
             try:
                 product_image = None
 
+                # ✅ используем preload (быстрее)
                 if preloaded_images and image_url in preloaded_images:
                     product_image = preloaded_images[image_url]
-                    logger.debug("Using preloaded image")
                 else:
-                    product_image = download_image(image_url, timeout=5)
+                     product_image = download_image(image_url, timeout=5)
 
                 if product_image:
-                    # Конвертируем в RGB если необходимо
-                    if product_image.mode != "RGB":
-                        product_image = product_image.convert("RGB")
 
-                    # Создаем ImageReader из PIL Image
-                    img_buffer = io.BytesIO()
-                    product_image.save(img_buffer, format="JPEG")
-                    img_buffer.seek(0)
-                    img_reader = ImageReader(img_buffer)
+                    # 🔥 СЖАТИЕ (главная оптимизация)
+                    img_reader = compress_image_for_pdf(product_image)
 
-                    # Рисуем изображение с центрированием по вертикали
+                    if img_reader:
                     img_size = 16 * mm
                     img_x = table_x + col_num_w + 1 * mm
                     img_y = row_center_y - (img_size / 2)
@@ -1918,10 +1951,11 @@ def generate_order_pdf(
                         mask="auto"
                     )
 
-            except Exception as e:
-                logger.warning(f"Could not add image to PDF: {e}")
-
-
+         except Exception as e:
+               logger.warning(f"Could not add image to PDF: {e}")
+        
+        
+        
         # ✅ РИСУЕМ ID ПРОДУКТА
         if product_id:
             id_x = table_x + col_num_w + col_image_w
