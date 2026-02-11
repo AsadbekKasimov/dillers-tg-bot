@@ -3519,7 +3519,7 @@ async def order_signature_handler(message: Message, state: FSMContext):
                 generate_order_pdf,
                 order_items=category_items,
                 total=category_total,
-                client_name=client_name,
+                client_name=final_name,
                 admin_name=ADMIN_NAME,
                 order_id=sub_order_id,
                 approved=True,
