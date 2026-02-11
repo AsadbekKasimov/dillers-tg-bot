@@ -3523,7 +3523,7 @@ async def order_signature_handler(message: Message, state: FSMContext):
                 admin_name=ADMIN_NAME,
                 order_id=sub_order_id,
                 approved=True,
-                category=cat,
+                category=category,
                 latitude=client_latitude,
                 longitude=client_longitude,
                 preloaded_images=sub_preloaded
