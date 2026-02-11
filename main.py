@@ -1769,7 +1769,7 @@ def generate_order_pdf(
 
     def draw_footer():
         c.setFont(main_font, 8)
-        # footer_text = f"PDF: {pdf_url}"
+        footer_text = f" "
         x = left_margin
         y_footer = bottom_margin - 6 * mm
         c.drawString(x, y_footer, footer_text)
