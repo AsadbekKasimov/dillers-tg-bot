@@ -712,8 +712,8 @@ class OrderDataValidator:
         if len(items) == 0:
             raise ValidationError("Заказ не может быть пустым")
 
-        if len(items) > 100:
-            raise ValidationError("Слишком много товаров (максимум 100)")
+        if len(items) > 200:
+            raise ValidationError("Слишком много товаров (максимум 200)")
 
         for idx, item in enumerate(items):
             if not isinstance(item, dict):
@@ -740,14 +740,14 @@ class OrderDataValidator:
 
             try:
                 price = float(item["price"])
-                if price < 0 or price > 1000000000:
+                if price < 0 or price > 10000000000:
                     raise ValidationError(f"Товар {idx + 1}: некорректная цена")
             except (ValueError, TypeError):
                 raise ValidationError(f"Товар {idx + 1}: цена должна быть числом")
 
             try:
                 qty = int(item[qty_field])
-                if qty <= 0 or qty > 10000:
+                if qty <= 0 or qty > 1000000000:
                     raise ValidationError(f"Товар {idx + 1}: некорректное количество")
                 # Нормализуем поле к "quantity" для единообразия
                 item["quantity"] = qty
@@ -756,7 +756,7 @@ class OrderDataValidator:
 
         try:
             total = float(data["total"])
-            if total < 0 or total > 10000000000:
+            if total < 0 or total > 1000000000000:
                 raise ValidationError("Некорректная общая сумма")
         except (ValueError, TypeError):
             raise ValidationError("Общая сумма должна быть числом")
