@@ -3518,7 +3518,7 @@ async def order_signature_handler(message: Message, state: FSMContext):
             pdf_category = await asyncio.to_thread(
                 generate_order_pdf,
                 order_items=category_items,
-                total=sub_total,
+                total=category_total,
                 client_name=client_name,
                 admin_name=ADMIN_NAME,
                 order_id=sub_order_id,
