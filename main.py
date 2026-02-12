@@ -1026,12 +1026,15 @@ def get_orders_by_base_id(base_order_id: str) -> List[Dict[str, Any]]:
 
 def save_client_notification(base_order_id: str, user_id: int, message_id: int):
     """Сохранение ID сообщения клиенту"""
-    with sqlite3.connect(DB_PATH) as conn:
-        c = conn.cursor()
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
         cursor.execute("""
-            INSERT OR REPLACE INTO client_notifications 
+            INSERT INTO client_notifications 
             (base_order_id, user_id, message_id, created_at)
             VALUES (%s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE 
+                message_id = VALUES(message_id),
+                created_at = VALUES(created_at)
         """, (base_order_id, user_id, message_id, datetime.now()))
         conn.commit()
 
@@ -2849,6 +2852,9 @@ async def callback_approve_order_confirmed(callback: CallbackQuery):
         await callback.answer("Заказ не найден", show_alert=True)
         return
 
+    # ⚡ ВАЖНО: Отвечаем сразу, чтобы избежать timeout (Telegram дает только 30 сек)
+    await callback.answer("⏳ Обработка заказа началась...")
+
     # Получаем категорию заказа
     order_category = order_data.get("category")
 
@@ -2859,17 +2865,22 @@ async def callback_approve_order_confirmed(callback: CallbackQuery):
 
     # Генерируем финальный PDF
     order_json = json.loads(order_data["order_json"])
-    preloaded_images = await preload_order_images(validated_data["items"])
+    client_name = order_data.get("client_name", "Клиент")
+    
+    # Проверяем, является ли заказ мультикатегорийным
+    is_multi_category = len(set(item.get("category") for item in order_json["items"])) > 1
+    
+    preloaded_images = await preload_order_images(order_json["items"])
     
     pdf_final = await asyncio.to_thread(
         generate_order_pdf,
-        order_items=validated_data["items"],
-        total=validated_data["total"],
+        order_items=order_json["items"],
+        total=order_json["total"],
         client_name=client_name,
         admin_name=ADMIN_NAME,
         order_id=order_id,
         approved=True,
-        category=None if is_multi_category else get_order_category(validated_data["items"]),
+        category=None if is_multi_category else get_order_category(order_json["items"]),
         latitude=client_latitude,
         longitude=client_longitude,
         preloaded_images=preloaded_images
@@ -2943,7 +2954,6 @@ async def callback_approve_order_confirmed(callback: CallbackQuery):
         caption=new_caption,
         reply_markup=kb
     )
-    await callback.answer("✅ Заказ одобрен!")
 
 
 @router.callback_query(F.data.startswith("admapprove_no:"))
